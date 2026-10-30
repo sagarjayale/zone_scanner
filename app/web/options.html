@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Options</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Zone scanner</span>
+  <nav class="nav" id="nav" aria-label="Pages" data-current="options"></nav>
+  <span class="spacer"></span>
+  <span class="badge" id="token">Checking login</span>
+</header>
+<main class="page">
+  <h1>Options</h1>
+  <p class="lede">The live option chain near the money, with the side the scanner gives for the chosen mode, the entry status, a suggested strike, and the confirmation score.</p>
+  <div class="filters">
+    <label>Instrument <select id="symbol"></select></label>
+    <label>Expiry <select id="expiry"></select></label>
+    <label>Mode <select id="mode"></select></label>
+    <button class="btn" id="refresh">Refresh chain</button>
+  </div>
+  <p class="status" id="status" role="status"></p>
+  <div class="side-banner" id="banner" hidden></div>
+  <dl class="figures" id="scores" hidden></dl>
+  <div class="split" id="decision" hidden>
+    <div><h2>Levels for the suggested option</h2><div id="levels"></div></div>
+    <div><h2>Confirmation checks</h2><ul class="checklist" id="checks"></ul></div>
+  </div>
+  <dl class="figures" id="figures" hidden></dl>
+  <div class="curve" id="suggestion" hidden></div>
+  <div class="table-wrap" id="chain-wrap" hidden>
+    <table class="chain">
+      <thead><tr><th colspan="7">Calls</th><th></th><th colspan="7">Puts</th></tr>
+      <tr><th></th><th>Build-up</th><th>Open interest</th><th>Change today</th><th>IV</th><th>Delta</th><th>Price</th><th>Strike</th><th>Price</th><th>Delta</th><th>IV</th><th>Change today</th><th>Open interest</th><th>Build-up</th><th></th></tr></thead>
+      <tbody id="chain"></tbody>
+    </table>
+  </div>
+</main>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/options.js"></script>
+</body>
+</html>

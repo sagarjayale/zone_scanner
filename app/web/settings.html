@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Zone scanner</span>
+  <nav class="nav" id="nav" aria-label="Pages" data-current="settings"></nav>
+  <span class="spacer"></span>
+  <span class="badge" id="token">Checking login</span>
+</header>
+<main class="page">
+  <h1>Settings</h1>
+  <p class="status" id="status" role="status"></p>
+
+  <h2>Upstox</h2>
+  <div class="actions"><a class="btn primary" href="/auth/login">Log in with Upstox</a><button class="btn" id="check-token">Check the token now</button><button class="btn" id="reconnect">Restart live prices</button><span id="calls" class="foot"></span></div>
+
+  <h2>Stock list</h2>
+  <p class="lede">Instruments the scanner syncs and scans. A new one is downloaded and scanned in the background.</p>
+  <div class="chips" id="universe"></div>
+  <div class="filters"><input type="text" id="find" placeholder="RELIANCE" aria-label="Find an instrument by symbol or name"><button class="btn" id="find-go">Find</button></div>
+  <div class="chips" id="found"></div>
+  <div class="filters">
+    <label>Add from an index <select id="idx-name"><option value="nifty50">Nifty 50</option><option value="niftybank">Nifty Bank</option><option value="niftynext50">Nifty Next 50</option><option value="niftymidcap100">Nifty Midcap 100</option></select></label>
+    <button class="btn" id="idx-load">Show its stocks</button>
+  </div>
+  <div class="filters">
+    <input type="text" id="paste" placeholder="RELIANCE, TCS, INFY" aria-label="Symbols to add, separated by commas or spaces" style="flex:1;min-width:260px">
+    <button class="btn" id="paste-go">Find these symbols</button>
+  </div>
+  <div id="picker" hidden>
+    <p class="lede" id="picker-note"></p>
+    <div class="actions"><button class="btn" id="pick-all">Select all</button><button class="btn" id="pick-none">Select none</button><button class="btn primary" id="pick-add">Add selected</button></div>
+    <div class="checks picker" id="picker-list"></div>
+  </div>
+
+  <h2>Zone rules</h2>
+  <div class="filters"><label>Apply to <select id="th-scope"><option value="">All timeframes</option></select></label></div>
+  <div class="form" id="th-form"></div>
+  <div class="actions"><button class="btn primary" id="th-save">Save zone rules</button><button class="btn" id="rebuild">Rebuild all zones with these rules</button></div>
+
+  <h2>Zone marking</h2>
+  <p class="lede">How a zone is found, tested, used up and scored, and how much history is searched. The Backtest page reads these settings at once, so you can check the same scan date under each. The dashboard follows after the rebuild.</p>
+  <div class="form">
+    <div><label class="lbl" for="marking_rule">Zones are marked by</label>
+      <select id="marking_rule">
+        <option value="scanner">scanner.py v6.4: any candle as leg-in, leg-out closes beyond the leg-in close, lines from the base candles, every candle that reaches the proximal line is a test, a close inside the zone uses it up</option>
+        <option value="pdf">GTF course PDF: exciting leg-in, leg-out closes beyond the whole leg-in, distal line from the leg-in or leg-out wick when it is beyond the base, gap candles, tests counted per visit</option>
+      </select></div>
+    <div><label class="lbl" for="htf_zone_pick">Nearest HTF demand and supply for the curve</label>
+      <select id="htf_zone_pick">
+        <option value="fresh">Never tested only (GTF PDF): a zone price has come back to is skipped, the next untested one is used</option>
+        <option value="any">Any live zone (scanner.py): tested zones count too</option>
+      </select></div>
+    <div><label class="lbl" for="zone_history">History searched for zones</label>
+      <select id="zone_history">
+        <option value="scanner">Same as scanner.py: Monthly and up from 2000, Weekly from 2010, Daily 5 years, Hourly 1 year; intraday from the start of the quarter, 5 and 15 min one month</option>
+        <option value="all">All stored history</option>
+      </select></div>
+  </div>
+  <div class="actions"><button class="btn primary" id="marking-save">Save and rebuild all zones</button></div>
+
+  <h2>Analysis modes</h2>
+  <p class="lede">Each mode reads an HTF for location and curve, an ITF for trend, and an LTF for the execution zone. The scanner runs the ticked ones.</p>
+  <div class="checks picker" id="modes"></div>
+  <div class="actions"><button class="btn primary" id="modes-save">Save modes</button></div>
+
+  <h2>Trade side rule</h2>
+  <p class="lede">How the curve and the ITF trend decide between buy, sell and no trade. Saving rescans every stock so the dashboard follows the rule you chose.</p>
+  <div class="form">
+    <div><label class="lbl" for="direction_rule">Buy or sell is decided by</label>
+      <select id="direction_rule">
+        <option value="location">Location beats trend: near demand buys, near supply sells, the ITF decides only in equilibrium</option>
+        <option value="trend">The ITF trend: up buys, down sells, the curve only blocks the two extremes</option>
+      </select></div>
+  </div>
+  <div class="actions"><button class="btn primary" id="rule-save">Save and rescan</button></div>
+
+  <h2>Trade score and entry type</h2>
+  <p class="lede">The trade score is freshness (fresh 3, tested once 1.5, tested twice 0) plus strength (a gap or two exciting candles 2, one exciting candle 1) plus time at base (1 to 3 candles 2, 4 to 5 candles 1, more 0), plus 1 when the 20 or 50 EMA runs through the zone. A score of 7 or more takes entry type 1, a limit at the proximal line. A score of 5 to 6.5 takes entry type 2 or 3. Below 5 there is no trade. The stop loss is the distal line for all three.</p>
+  <div class="form">
+    <div><label class="lbl" for="entry_23">A score of 5 to 6.5 enters with</label>
+      <select id="entry_23">
+        <option value="TYPE_3">Entry type 3: a candle closes inside the zone and the next closes back out of it (entry at that close)</option>
+        <option value="TYPE_2">Entry type 2: a candle closes inside the zone and the next opens inside it (entry at that open)</option>
+      </select></div>
+  </div>
+  <div class="actions"><button class="btn primary" id="entry-save">Save and rescan</button></div>
+
+  <h2>Calendar</h2>
+  <div class="form">
+    <label class="check"><input type="checkbox" id="fiscal_year"> Half year and year start in April</label>
+  </div>
+
+  <h2>Paper trading</h2>
+  <div class="form">
+    <div><label class="lbl" for="paper_capital">Starting capital</label><input type="number" id="paper_capital" min="1000" step="1000"></div>
+    <div><label class="lbl" for="paper_risk_pct">Risk per trade, % of capital</label><input type="number" id="paper_risk_pct" min="0.05" max="10" step="0.05"></div>
+    <div><label class="lbl" for="paper_slippage_pct">Slippage on manual close, %</label><input type="number" id="paper_slippage_pct" min="0" max="2" step="0.01"></div>
+  </div>
+
+  <h2>Options</h2>
+  <div class="form">
+    <div><label class="lbl" for="option_max_spread_pct">Largest bid-ask spread, % of price</label><input type="number" id="option_max_spread_pct" min="0.1" max="20" step="0.1"></div>
+    <div><label class="lbl" for="option_min_oi">Smallest open interest</label><input type="number" id="option_min_oi" min="0" step="100"></div>
+  </div>
+  <div class="actions"><button class="btn primary" id="misc-save">Save calendar, paper and option settings</button></div>
+
+  <h2>Telegram alerts</h2>
+  <p class="lede" id="tg-state"></p>
+  <div class="form">
+    <div><label class="lbl" for="telegram_token">Bot token</label><input type="password" id="telegram_token" autocomplete="off" placeholder="leave empty to keep the stored one"></div>
+    <div><label class="lbl" for="telegram_chat_id">Chat id</label><input type="text" id="telegram_chat_id"></div>
+    <label class="check"><input type="checkbox" id="telegram_alerts"> Send alerts to Telegram</label>
+  </div>
+  <div class="actions"><button class="btn primary" id="tg-save">Save Telegram settings</button><button class="btn" id="tg-test">Send test alert</button></div>
+
+  <h2>Recent jobs</h2>
+  <div class="table-wrap"><table><thead><tr><th>Job</th><th>Started</th><th>Ended</th><th>Status</th><th>Detail</th></tr></thead><tbody id="jobs"></tbody></table></div>
+
+  <h2>Rejection log</h2>
+  <p class="lede">Zone candidates from the last 90 days that failed a rule, newest first. Use it to check the engine against your own marking.</p>
+  <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Timeframe</th><th>Candle</th><th>Reason</th></tr></thead><tbody id="rejections"></tbody></table></div>
+</main>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper trading</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Zone scanner</span>
+  <nav class="nav" id="nav" aria-label="Pages" data-current="paper"></nav>
+  <span class="spacer"></span>
+  <span class="badge" id="token">Checking login</span>
+</header>
+<main class="page">
+  <h1>Paper trading</h1>
+  <p class="lede">Practice with the scanner's own plans. A trade score of 7 or more is an entry type 1 order (a limit at the proximal line); a score of 5 to 6.5 is an entry type 2 or 3 order, which waits for its candles. Fills are simulated against live Upstox prices; no order is ever sent to your broker.</p>
+  <dl class="figures" id="figures"></dl>
+  <div class="actions">
+    <label class="check"><input type="checkbox" id="auto"> Take every setup automatically at score</label>
+    <select id="auto-score" aria-label="Minimum score for automatic orders"><option>5</option><option>6</option><option>7</option><option selected>8</option></select>
+    <span class="spacer"></span>
+    <button class="btn" id="reset">Reset paper account</button>
+  </div>
+  <p class="status" id="status" role="status"></p>
+  <h2>Open positions</h2>
+  <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Side</th><th>Quantity</th><th>Filled</th><th>Stop</th><th>Target</th><th>Price</th><th>Profit or loss</th><th></th></tr></thead><tbody id="open"></tbody></table></div>
+  <h2>Pending orders</h2>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Instrument</th><th>Timeframe</th><th>Side</th><th>Quantity</th><th>Entry type</th><th>Entry</th><th>Stop</th><th>Target</th><th>Price</th><th></th></tr></thead><tbody id="pending"></tbody></table></div>
+  <h2>Closed trades</h2>
+  <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Side</th><th>Quantity</th><th>Filled</th><th>Exited</th><th>Entry</th><th>Exit</th><th>Why</th><th>Profit or loss</th><th>Result</th></tr></thead><tbody id="closed"></tbody></table></div>
+</main>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/paper.js"></script>
+</body>
+</html>
