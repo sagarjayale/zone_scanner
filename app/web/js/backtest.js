@@ -20,12 +20,16 @@ function syncAll() {
 }
 $("s-all").onchange = () => { for (const b of boxes()) b.checked = $("s-all").checked; syncAll(); };
 
+// A win: the target was hit, or a trailing stop closed the trade above 0 R after costs.
+const isWin = (o) => o.status === "target hit" || (o.status === "trailed out" && (o.result_r || 0) > 0);
 function outcomeCell(o) {
   if (!o.entry_ts) return el("td", { class: "outcome muted" }, o.status === "never entered" ? "Never entered" : "Not taken", el("span", { class: "sub wrap" }, o.note || ""));
   const r = o.result_r == null ? "" : `, ${signedR(o.result_r)}`;
-  const head = o.status === "target hit" ? `Target hit${r}` : o.status === "stopped" ? `Stopped${r}` : `Still open${r}`;
-  return el("td", { class: "outcome" }, el("span", { class: o.status === "target hit" ? "win" : o.status === "stopped" ? "loss" : "" }, head),
-    el("span", { class: "sub wrap" }, `in ${stamp(o.entry_ts)} at ${fmtPrice(o.entry)}, stop loss ${fmtPrice(o.stop)}, target ${fmtPrice(o.target)}, out ${stamp(o.exit_ts)}`));
+  const head = o.status === "target hit" ? `Target hit${r}` : o.status === "stopped" ? `Stopped${r}` : o.status === "trailed out" ? `Trailing stop${r}` : `Still open${r}`;
+  const cls = isWin(o) ? "win" : o.status === "stopped" || o.status === "trailed out" ? "loss" : "";
+  const trail = o.stop_moves ? `, stop moved ${o.stop_moves}× to ${fmtPrice(o.final_stop)} (best +${o.best_r} R)` : "";
+  return el("td", { class: "outcome" }, el("span", { class: cls }, head),
+    el("span", { class: "sub wrap" }, `in ${stamp(o.entry_ts)} at ${fmtPrice(o.entry)}, stop loss ${fmtPrice(o.stop)}, target ${fmtPrice(o.target)}${trail}, out ${stamp(o.exit_ts)}`));
 }
 const planCell = (x, earlier) => el("td", {}, x ? `${x.entered} entered, ${x.target_hit} target, ${x.stopped} stopped` : "",
   el("span", { class: "sub" }, [earlier ? `earlier rules: ${earlier.toLowerCase()}` : "", x && x.entered ? `${x.win_rate == null ? "no closed trade" : x.win_rate + "% win"}, ${signedR(x.total_r)}` : ""].filter(Boolean).join(", ")));
@@ -35,8 +39,8 @@ function totals(rows) {
   const out = {};
   for (const [name] of PLANS) {
     const got = rows.map((r) => r.outcomes[name]);
-    const entered = got.filter((o) => ["target hit", "stopped", "open"].includes(o.status)), closed = entered.filter((o) => o.status !== "open");
-    const wins = closed.filter((o) => o.status === "target hit");
+    const entered = got.filter((o) => ["target hit", "stopped", "trailed out", "open"].includes(o.status)), closed = entered.filter((o) => o.status !== "open");
+    const wins = closed.filter(isWin);
     out[name] = { entered: entered.length, target_hit: wins.length, stopped: closed.length - wins.length, open: entered.length - closed.length,
       never_entered: got.filter((o) => o.status === "never entered").length, not_taken: got.filter((o) => o.status === "not taken").length,
       win_rate: closed.length ? Math.round(1000 * wins.length / closed.length) / 10 : null,
@@ -46,9 +50,16 @@ function totals(rows) {
 }
 function zoneCell(z, tf) {
   if (!z) return el("td", { class: "muted" }, "None");
-  return el("td", { class: "num" }, `${fmtPrice(z.proximal)} to ${fmtPrice(z.distal)}`, el("span", { class: "sub" }, `${TF_LABEL[tf] || ""}, score ${z.score} (${LABEL_TEXT[z.label] || z.label})`));
+  return el("td", { class: "num" }, `${fmtPrice(z.proximal)} to ${fmtPrice(z.distal)}`, el("span", { class: "sub" }, `${TF_LABEL[tf] || ""}${z.pattern ? " " + z.pattern : ""}, score ${z.score} (${LABEL_TEXT[z.label] || z.label})`));
 }
 
+// The trailing stop the check was run with (saved with it), in words.
+function trailText(t) {
+  if (!t || !t.trail_method || t.trail_method === "off") return " Trailing stop: off.";
+  const tf = t.trail_tf === "itf" ? "ITF" : t.trail_tf === "live" ? "LTF (live prices in paper trading; a past date has only candles)" : "LTF";
+  const how = t.trail_method === "lock" ? `lock, ${t.trail_lock_pct}% steps of the target` : `${t.trail_method}, from +${t.trail_start_r} R`;
+  return ` Trailing stop: ${how}, on ${tf} candles${t.trail_keep_target === false && t.trail_method !== "lock" ? ", target removed once it starts" : ""}.`;
+}
 let report = null;
 function showReport(out) {
   shown = out.id; report = out;
@@ -56,7 +67,9 @@ function showReport(out) {
   PLANS = (old ? OLD_PLANS : NEW_PLANS).map((k) => [k, PLAN_NAME[k]]);
   PLANS.forEach(([, label], n) => { $("s-p" + (n + 1)).textContent = label; });
   $("s-rule-line").textContent = old ? "This check was saved under the earlier entry rules (aggressive, confirmation, conservative). Run the date again to see it with entry types 1, 2 and 3."
-    : "A trade score of 7 or more follows entry type 1. A score of 5 to 6.5 follows entry types 2 and 3, and only on the zone's next test. \"Not taken\" means the score does not use that entry.";
+    : "A trade score of 7 or more follows entry type 1. A score of 5 to 6.5 follows entry types 2 and 3, and only on the zone's next test. \"Not taken\" means the score does not use that entry." + trailText(out.trail);
+  $("s-csv").hidden = !out.id;             // only a saved check can be downloaded
+  if (out.id) $("s-csv").href = `/api/scancheck/${out.id}/export`;
   $("s-result").hidden = false;
   if (!$("sf-hd")) buildScoreFilters($("score-filters"), drawReport);      // score filters: 7 or more to begin with
   drawReport();

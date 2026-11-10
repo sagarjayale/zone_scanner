@@ -34,6 +34,9 @@ the right to create that database, or create it yourself first:
 Leave the `DB_` values empty to use a local SQLite file instead. Moving from SQLite to MySQL starts with an
 empty database: press Sync all, then Scan all, on the Data page.
 
+Optional: `SCAN_WORKERS=2` in `.env` sets how many processes scan stocks side by side on MySQL (default: CPU cores
+less one, at most 4; `0` switches them off). See Speed.
+
 Open http://127.0.0.1:8000 for the pages, or http://127.0.0.1:8000/docs to call every endpoint by hand.
 
 ## First use, in order
@@ -177,7 +180,11 @@ nearest HTF zones must never have been tested) the app:
   trades, saved scan-date checks and option snapshots are kept; pending paper orders are cancelled);
 - removes the settings the rules no longer have (strong leg-out body and conservative target), and sets "Zone
   marking" back to its default, scanner.py v6.4;
-- finds every zone again from the stored candles, in the background, as the job "rebuild after a rule change".
+- empties the zone tables and finds every zone again from the stored candles, in the background, as the job
+  "rebuild after a rule change". Nothing of this runs during start-up, so the app always starts at once. On MySQL the
+  tables are emptied with TRUNCATE, which takes a moment however many rows they hold. If another database connection
+  holds a table (for example a second copy of the app), the job waits and tries again for up to ten minutes and says
+  so under Recent jobs. If the app is stopped before the job has finished, it runs again at the next start.
   No download is needed and the pages stay usable; each stock's result comes back as its rebuild finishes.
 
 Saved scan-date checks made before the update keep their aggressive, confirmation and conservative columns and open
@@ -411,8 +418,29 @@ against every timeframe above it, and its mode's HTF zone, against every timefra
 
 ## Speed
 
-- A scan never blocks the pages: it runs in a worker thread with its own database session. So does the database
-  part of a sync. Up to four instruments are downloaded side by side.
+**Pages only read; scans and downloads run in the background.** No page request downloads anything or works anything
+out for the whole stock list:
+
+- **Dashboard:** the saved result of every ready stock, read in one query. A stock whose result for that mode was
+  never saved is shown as "being worked out", and its result is built in the scan workers and saved; the dashboard
+  shows it at its next refresh. From then on every scan keeps that mode's result up to date.
+- **Data page:** the candle count of each stock and timeframe is saved at each sync and read from there. Rows saved by
+  an earlier version are counted once, in the background, at the first start.
+- **GTF EYE and Premium:** each scan saves one row per stock and mode (zones, last HTF candles, ATR %, IV, signal).
+  The pages read them in one query and apply the live price. Stocks scanned before this version are saved in the
+  background the first time the page is opened ("N more stocks are still being prepared").
+- **Index bias on the Dashboard:** read from the saved results of the indices.
+- **Slow request log:** any API call over 1 second is written to the app's log as `slow request: GET /api/... took 2.31 s`.
+- Measured in the tests with 200 stocks: every page's data under 0.11 s (`tests/test_zz_speed.py`, limit 0.3 s).
+
+- A scan never blocks the pages. On MySQL it runs in a separate worker process (app/jobs/scanpool.py), so up to four
+  stocks are scanned at the same time on different CPU cores while the web server stays free for the pages. The
+  number is `SCAN_WORKERS` in `.env` (default 2 on a computer with 6 or more CPU cores, else 1; at most 4; `0` = off).
+  Workers run at a lower CPU priority (nice 10) than the web server, so a page is always served first. On SQLite scans
+  run one at a time in a worker thread, because SQLite lets only one writer in at a time. One stock is never scanned
+  twice at once. If a worker process dies (out of memory, killed), new ones are started and that stock is scanned in a
+  thread. The scan-date checks on the Backtest page use their own workers, so a long check never delays the live scans.
+- The database part of a sync runs in a worker thread with its own session. Up to four instruments are downloaded side by side.
 - The five-minute job skips every timeframe that received no new candle. Scan all and Rescan still replan everything.
 - Zones found in a scan are written in one go at the end, not one by one.
 - On the first scan of a stock, zones that were used up long ago are not stored at all. Violated and used-up zones are
@@ -432,6 +460,34 @@ against every timeframe above it, and its mode's HTF zone, against every timefra
   and are untested.
 - While a newly added stock is scanned for the first time, the pages can pause for a few seconds.
 
+## Other LTF zones
+
+Each stock's result shows one LTF zone: the best one, the **default zone**. The signal, entry, stop, target and the
+default paper order come from it, unchanged. Often there are more valid LTF zones between the HTF zone and the price.
+They are saved with the result as `other_ltf_zones`, built during the scan (the pages only read them):
+
+- the same candidates the default zone comes from (same function, same rules), after the first one, best first, and
+  only those whose trade score takes an entry type (5 or more);
+- for each: the zone, score, type, state, entry type, entry, stop loss, target, whether it is still waiting, the
+  proximal line to watch, the stop distance (entry to stop) as % of price, the NSE costs in R, and whether a pending
+  paper plan exists for it.
+
+**Dashboard:** "Other LTF zones: Off / score 5+ / 6+ / 7+ / 8" in the filter bar, remembered in this browser (Off if the
+browser does not allow storage). When on, each stock with a signal gets one "↳ other LTF zone" row per zone at or
+above the score, with a Paper trade button, and "+N more LTF zones" when the score hides some.
+**Chart:** the same dropdown in the "Show on the chart" row draws those zones dashed and lighter, labelled with
+their score and entry type. The default LTF zone and the HTF zones are drawn as before.
+
+**Alerts and automatic paper orders** come from each mode's default zone only. Settings, "Alerts and automatic paper
+orders on every LTF zone", switches them on for every zone. (Before this version every zone with a pending plan raised
+alerts; plans made before the update count as default until the next scan marks them.)
+
+**Costs in R.** NSE equity charges for a round trip (brokerage, the lower of a flat amount and a percentage per order;
+STT; exchange transaction charge; SEBI fee; GST on brokerage and charges; stamp duty on the buy side), for delivery or
+intraday, all in Settings, "NSE charges". The trade is sized like a paper trade (capital and risk per trade) and valued
+at the entry price on both sides; the charges are divided by its 1 R. The default rates are starting values: check
+them against your broker's contract note. On thin zones the charges can be a large part of the risk, even more than 1 R.
+
 ## Paper trading rules
 
 - An order is created from a zone's current plan (Paper trade on the scanner), or automatically for every watched
@@ -447,6 +503,85 @@ against every timeframe above it, and its mode's HTF zone, against every timefra
 - Safety net: after every 5 minute bar the stored candles are replayed against each order and position with the
   backtest's rules, so a fill or stop that happened between two price polls is not missed.
 - Option positions bought from the Options page have no stop or target; close them yourself.
+- **Enter now at market** (pending orders, any entry type, market hours only): fills at once at the live price plus the
+  slippage setting. The stop loss stays on the distal line; the target is moved so the trade keeps 2 times its risk,
+  and the quantity is sized again. Refused when the price is already beyond the stop loss.
+- **Chart** (every pending order, open position and closed trade): opens a chart on the zone's timeframe with the
+  zone, entry, stop loss, target, entry and exit markers, and the details: mode, entry type, whether the zone is the
+  mode's default zone or another one, trade score, curve and ITF trend when planned, zone state, times, result and
+  every change to the stop or target. Option positions show the details only (no option candles are stored).
+
+- **Trailing stop** (Settings, off by default): see "Trailing stop loss". A position keeps the trailing settings it
+  was filled with, even if you change them later. Its stop is worked out again after each bar close from the closed
+  candles of its trailing timeframe since the fill, and moved when that is better. A position that ends on a moved stop
+  closes as "Trailing stop"; every move is listed under Changes in the chart view.
+- **Download CSV** (Closed trades): every closed paper trade, newest first, with the first stop, the stop at the exit,
+  how often it moved, the exit reason and the duration. Times are IST. Reset trades are left out.
+
+## Trailing stop loss
+
+Off by default, so nothing changes until you switch it on (Settings, Trailing stop loss). The same code
+(app/sim/trailing.py) moves the stop in paper trading and in the scan-date checks on the Backtest page.
+
+- R is the distance from the entry to the first stop (the distal line).
+- The stop is worked out again only when a candle closes: LTF candles (the trade's own timeframe) or ITF candles (the
+  mode's middle timeframe). Only candles that opened after the fill count. Within a candle the stop is checked before
+  it moves, the cautious assumption.
+- The stop only moves in your favour. Once trailing has started it never sits below break-even, and break-even
+  includes the NSE charges of the round trip (paper) or the cost per side (Backtest page), so it is about 0 R after costs.
+
+| Method | Where the stop goes (a long; a short is the mirror) |
+| --- | --- |
+| Step | From +1 R (setting), break-even, then +0.5 R for every 0.5 R gained: +1.5 R puts it at +0.5 R, +2 R at +1 R |
+| Swing | Just under each new swing low (a low below the set number of candles on each side), less 0.1 of the average candle range |
+| ATR | The best price since the entry less the set number of ATRs (14 candles of the trailing timeframe) |
+| Lock | Steps of a set % of the distance to the target (default 10%). When price passes a step by the gap (default 20% of a step), the stop moves to it. At the target the trade either closes, or the target moves one step on and only the stop ends the trade |
+
+- "Keep the fixed target while trailing" off: the target is removed once trailing starts, so the trade runs until the stop.
+- Backtest page: a trade that ends on a moved stop is shown as "Trailing stop". It counts as a win when its result after
+  costs is above 0 R, otherwise as stopped. The trailing settings a check ran with are saved with it and shown in the report.
+- Untested on real data. Trailing usually turns some 2 R winners into smaller winners and some losers into break-even
+  trades; whether that helps depends on the stocks and the mode. Compare the same scan dates with it off and on.
+
+## Paper page: trailing ladder and distance to entry
+
+**Open positions, "Trailing / locked".** For a position filled with the lock trailing stop, a step ladder:
+- the header: "🔓 Not locked yet · Step 0 of N" with the stop and its risk, or "🔒 Step X of N locked · stop P" with what
+  the stop keeps in R and in rupees, and after the round-trip NSE charges at the stop. N is the number of steps from the
+  entry to the first target (Lock 25 % = 4, 10 % = 10, 50 % = 2); beyond the target ("move") it reads "Step 5 (1 beyond
+  target)" under a gold "🎯 First target reached · running beyond target" line;
+- the bar from the entry to the current target: locked steps green, the next step and the target gold, a dot at the
+  live price (red below the entry for a long, above it for a short);
+- "Next: step X+1 → stop L when price reaches T (n % away)", or "(reached: locks at the next candle close)": the stop
+  only moves when a candle closes.
+- A green left edge once a step is locked; a red tint and "near the stop" when the price is within 0.3 R of the stop
+  (R = entry to the first stop). Other trailing methods, or none, show one line with the stop and what it keeps.
+
+**Pending orders, "Distance to entry".** How far the price still has to travel to the entry, in R (entry to stop):
+🔴 entering now under 0.25 R (pulsing), 🟢 close up to 1 R, 🟡 between 1 and 3 R, ⚪ far beyond 3 R (dimmed). Chips above the
+table count each group and show one group at a time (remembered in the browser); rows are sorted nearest first. The
+direction and a rough time come from the live prices of the last 5 minutes, kept in the page only ("⬇ coming closer, ~12
+min at this speed", "⬆ moving away", "➖ flat", "measuring…" in the first minute). Entry type 2 and 3 orders also say
+where their zone stands: waiting for a candle to close inside it, price in the zone, or armed. Outside market hours
+the last price is shown with "market closed". Prices are rounded to each stock's tick size (from the instrument file,
+0.05 until it is stored).
+
+**Gap at the open.** A limit order whose candle opens beyond the entry fills at the open (a better price than the
+limit, but nearer the stop); if the open is beyond the stop as well, it is a loss at the open. Live prices in the first
+five minutes of the session (before 09:20) are read the same way. An open position's stop gapped through exits at the open.
+
+## Automatic orders when the market is closed
+
+Paper page, **"Also place automatic orders after a scan when the market is closed"** (off by default; "Take every
+setup automatically" must be on too). After a scan while the market is closed (Scan all on the Data page, the 09:00
+catch-up, the 15:40 end of day), every setup of the saved scan that automatic orders would take gets a pending order:
+fresh zone, score at least the auto score, the mode's best zone, no order on it yet. Each says "placed while the market
+was closed, from the scan of Sun 07 Jun 16:00". Nothing fills until the open; from 09:15 the live prices and the 5 minute
+candles fill and manage them as usual, including a gap at the open.
+
+**"Place automatic orders now"** does the same from the last saved scan (no download, no new scan), with the market
+open or closed, and lists the orders placed and every setup skipped with the reason ("score 7 is below your auto score
+8", "an order already exists for this zone").
 
 ## Telegram
 
@@ -487,7 +622,73 @@ The Backtest page has one form and one date. You pick stocks, a mode and a scan 
 - The report shows totals per entry type and one row per stock, with a "Chart and replay" link that opens the chart on that scan date.
 - **Past checks:** every check is saved and listed under the form, newest first, with its totals. Click one to open its
   report again exactly as it was; Delete removes it. They are kept in the backtest runs table.
+- **Download CSV:** a saved check downloads as one line per stock and entry type, with the status, entry, stop,
+  target, exit and result in R (and the trailing stop moves when trailing was on).
 - One date is one sample. It shows how the rules read a stock on a day you choose, not a win rate.
+
+## GTF EYE and Premium pages
+
+Both read the rows each scan saves (see Speed); nothing is downloaded or worked out when the page asks. Only stocks that have been downloaded
+and scanned are listed. Click a stock to open its chart on that zone.
+
+- **Zone timeframe:** 30 min, Hourly, 2 hr, 4 hr, Daily, Weekly, Monthly, Quarterly, Half yearly or Yearly: the HTF
+  zones of that mode. The page reloads every 30 seconds.
+- **Approaching:** the price is within the approach % (Settings) of the nearest zone's proximal line, outside it.
+- **In zone:** the price is between the proximal and distal lines of an active zone.
+- **Reacting:** one of the last 3 closed HTF candles touched an active zone, and the price is back outside it, moving
+  away (above a demand zone, below a supply zone), not yet more than 2 zone heights from it.
+- Only zones tested at most "wick tests" times before count, as for trading. The test going on is not counted.
+- **Standard mode** shows the HTF zone only. **GTF mode** keeps only stocks whose full GTF chain (curve, ITF trend,
+  LTF zone) gives the same side, as on the Dashboard.
+- **Premium:** low volatility (the lowest third), high volatility (the highest third) or reacting from an HTF zone.
+  Volatility is either daily ATR % (the average true range of the last 14 daily candles as a % of the price, every
+  stock) or IV percentile (the at-the-money IV against the last 252 stored days, from the snapshots the Options page
+  stores, so only stocks with options and enough stored days).
+- The pages describe where price is; they are not signals on their own.
+
+## Trade filters for LTF zones
+
+All off by default (Settings, Trade score and entry type). A zone a filter leaves out is listed with its reason
+(`skipped_ltf_zones` in the result), the next best zone is used, and when none is left the Dashboard says "The LTF
+zone is not traded: ..." with the reason. Saving rescans every stock. The Backtest page applies them as of the scan
+date. Untested on real data: switch on one at a time and compare the same dates on the Backtest page.
+
+- **Smallest stop, % of price:** a zone whose proximal-to-distal distance is under this % is not traded (charges take
+  most of the profit of a very thin zone).
+- **Reaction zones (GTF PDF p.35-36):** a zone whose base sits on an earlier zone of the same side formed in that
+  zone's reaction and is not traded, unless its leg-out is strong (a gap or two exciting candles).
+- **Next HTF in the way (GTF PDF p.30):** no trade when a fresh opposite zone one timeframe above the mode's HTF
+  (4 hr above 2 hr, Week above Day, and so on) lies between the entry and the target.
+
+## ITF trend rule
+
+Settings, Trade side rule. The 50 SMA of the ITF must move more than a threshold over 7 candles to count as up or down.
+"A share of price" (the default, scanner.py) uses 0.05% of price. "A share of the average candle move" uses 0.1 times
+the average close-to-close move of the last 14 ITF candles, so a quiet stock and a volatile one are judged alike. With
+fewer candles the threshold widens as scanner.py does (10 and 40 times for the share of price, 5 and 15 times for the
+average move).
+
+## Signal since
+
+Each saved result keeps when its signal (Buy, Sell or No trade) first appeared. It moves only when the signal changes,
+and the Dashboard shows it under the signal ("since 10:15", or the date for an earlier day).
+
+## Chart: patterns and the live candle
+
+- Every zone band shows its pattern (DBR, RBR, RBD, DBD) in its bottom-right corner; switch "Pattern" off to hide it.
+  The Dashboard, Backtest and GTF EYE show the pattern next to each zone too.
+- **Live candle:** during market hours the candle still forming on the chosen timeframe is drawn faintly and follows
+  the live price every 5 seconds. It is built from the stored 5 minute candles of its period (and the closed days, for
+  a week or longer) plus the live price. It is drawn only: never stored and never used to find or test a zone. When
+  its period ends the chart reloads, and the closed candle comes from the stored candles.
+- The live chart loads its candles, zones, other timeframes' zones and the mode's result in one request (`/api/chart`).
+
+## Base candle limits for LTF zones
+
+Settings, Trade score and entry type: "LTF zone: fewest base candles" and "most base candles" (0 = off, the default).
+An LTF execution zone outside the limits is not traded and the next best zone is used. Zones are still found, tested
+and scored the same way, and HTF zones are never filtered. Saving rescans every stock. The same limits apply to the
+Backtest page and to "Other LTF zones".
 
 ## Chart: scan date and replay
 
@@ -526,7 +727,7 @@ The date-range backtest (From and To) is no longer on the page. Its API and its 
 python -m pytest tests -q
 ```
 
-144 tests. They run on a throwaway SQLite file and never touch your database, even with `DB_` values in `.env`.
+153 tests. They run on a throwaway SQLite file and never touch your database, even with `DB_` values in `.env`.
 To run them on MySQL, use an empty throwaway database (it is wiped at the start of the run):
 
 ```
@@ -582,8 +783,10 @@ app/sim/                 fills (shared fill rules), backtest, scan-date check, r
 app/options/chain.py     chain view, suggested strike, snapshots, IV percentile
 app/alerts/telegram.py   Telegram sender and message text
 app/live.py              price polling, alerts, paper fills, the page WebSocket hub
-app/jobs/                scheduler (the cron jobs) and the job runner
-app/web/                 seven pages; vendored Lightweight Charts 5.2.1 (Apache 2.0)
+app/jobs/                scheduler (the cron jobs), the job runner and the scan worker processes (scanpool.py)
+app/engine/eye.py        GTF EYE and Premium: in zone, reacting, approaching; ATR % and IV
+app/sim/trailing.py      trailing stop loss, shared by paper trading and the scan-date check
+app/web/                 nine pages; vendored Lightweight Charts 5.2.1 (Apache 2.0)
 app/main.py              47 endpoints, two WebSockets and the pages
 tests/                   81 tests
 ```

@@ -12,7 +12,9 @@ const RULES = [["base_body_pct", "Base candle: body below, % of range", 1], ["le
   ["htf_buffer_pct", "Allow execution zones beyond the HTF distal by, % of its width", 1],
   ["contact_touch_pct", "HTF contact: touching within, % of price", 0.05], ["contact_near_pct", "HTF contact: near within, % of price", 0.1],
   ["target_rr", "Target, times the distance from entry to stop loss", 0.5]];
-const MISC_NUM = ["paper_capital", "paper_risk_pct", "paper_slippage_pct", "option_max_spread_pct", "option_min_oi"], MISC_BOOL = ["fiscal_year"];
+const MISC_NUM = ["paper_capital", "paper_risk_pct", "paper_slippage_pct", "option_max_spread_pct", "option_min_oi", "brokerage_per_order", "brokerage_pct",
+  "stt_delivery_pct", "stt_intraday_pct", "exchange_txn_pct", "sebi_fee_per_crore", "gst_pct", "stamp_delivery_pct", "stamp_intraday_pct"];
+const MISC_BOOL = ["fiscal_year", "ltf_alerts_all_zones"];
 
 function renderUniverse() {
   const box = $("universe");
@@ -120,11 +122,23 @@ function fill() {
   renderUniverse(); renderRules(); renderModes();
   for (const k of MISC_NUM) $(k).value = S[k];
   for (const k of MISC_BOOL) $(k).checked = Boolean(S[k]);
+  $("nse_product").value = S.nse_product === "intraday" ? "intraday" : "delivery";
   $("direction_rule").value = S.direction_rule || "location";
   $("entry_23").value = S.entry_23 === "TYPE_2" ? "TYPE_2" : "TYPE_3";
   $("marking_rule").value = S.marking_rule === "pdf" ? "pdf" : "scanner";
   $("zone_history").value = S.zone_history === "all" ? "all" : "scanner";
   $("htf_zone_pick").value = S.htf_zone_pick === "any" ? "any" : "fresh";
+  $("ltf_min_bases").value = S.ltf_min_bases ?? 0; $("ltf_max_bases").value = S.ltf_max_bases ?? 0;
+  $("min_stop_pct").value = S.min_stop_pct ?? 0; $("skip_reaction_zones").checked = Boolean(S.skip_reaction_zones);
+  $("check_next_htf").checked = Boolean(S.check_next_htf);
+  $("itf_rule").value = S.itf_rule === "atr" ? "atr" : "pct"; $("itf_slope_pct").value = S.itf_slope_pct ?? 0.05; $("itf_atr_mult").value = S.itf_atr_mult ?? 0.1;
+  showItfFields();
+  $("trail_method").value = S.trail_method || "lock"; $("trail_tf").value = ["ltf", "itf"].includes(S.trail_tf) ? S.trail_tf : "live";
+  $("trail_lock_behind").checked = Boolean(S.trail_lock_behind);
+  for (const k of TRAIL_NUM) $(k).value = S[k];
+  $("trail_lock_target").value = S.trail_lock_target === "close" ? "close" : "move";
+  $("trail_keep_target").checked = S.trail_keep_target !== false;
+  showTrailFields(); showTrailExample();
   $("telegram_chat_id").value = S.telegram_chat_id || ""; $("telegram_alerts").checked = Boolean(S.telegram_alerts);
   $("tg-state").textContent = S.telegram_configured ? "A bot token and chat id are stored. Alerts and paper fills are sent to that chat." : "Not set up yet. Create a bot with BotFather in Telegram, then enter its token and your chat id.";
 }
@@ -142,7 +156,8 @@ $("modes-save").onclick = async () => {
 };
 $("rule-save").onclick = async () => {
   try {
-    S = await put({ direction_rule: $("direction_rule").value }); fill();
+    S = await put({ direction_rule: $("direction_rule").value, itf_rule: $("itf_rule").value,
+      itf_slope_pct: Number($("itf_slope_pct").value) || 0.05, itf_atr_mult: Number($("itf_atr_mult").value) || 0.1 }); fill();
     await post("/api/scan/run", { symbols: "all" });       // plans and results are rebuilt under the rule just saved
     say("Rule saved. Every stock is being rescanned now; see Recent jobs."); loadJobs();
   } catch (e) { say(e.message, true); }
@@ -156,12 +171,47 @@ $("marking-save").onclick = async () => {
 };
 $("entry-save").onclick = async () => {
   try {
-    S = await put({ entry_23: $("entry_23").value }); fill();
+    S = await put({ entry_23: $("entry_23").value, ltf_min_bases: Math.round(Number($("ltf_min_bases").value) || 0),
+      ltf_max_bases: Math.round(Number($("ltf_max_bases").value) || 0), min_stop_pct: Number($("min_stop_pct").value) || 0,
+      skip_reaction_zones: $("skip_reaction_zones").checked, check_next_htf: $("check_next_htf").checked }); fill();
     await post("/api/scan/run", { symbols: "all" });       // plans and results are rebuilt with the entry just chosen
     say("Entry saved. Every stock is being rescanned now; see Recent jobs."); loadJobs();
   } catch (e) { say(e.message, true); }
 };
-$("misc-save").onclick = async () => { const out = {}; for (const k of MISC_NUM) out[k] = Number($(k).value); for (const k of MISC_BOOL) out[k] = $(k).checked;
+function showItfFields() {
+  const atr = $("itf_rule").value === "atr";
+  $("itf_slope_pct").closest("div").style.display = atr ? "none" : ""; $("itf_atr_mult").closest("div").style.display = atr ? "" : "none";
+}
+$("itf_rule").onchange = showItfFields;
+const TRAIL_NUM = ["trail_start_r", "trail_atr_mult", "trail_swing", "trail_lock_pct", "trail_lock_gap_pct"];
+// Only the fields of the chosen method are shown.
+function showTrailFields() {
+  const m = $("trail_method").value, show = (id, on) => { $(id).closest("div, label").style.display = on ? "" : "none"; };
+  show("trail_tf", m !== "off"); show("trail_start_r", m !== "off" && m !== "lock"); show("trail_atr_mult", m === "atr"); show("trail_swing", m === "swing");
+  show("trail_lock_pct", m === "lock"); show("trail_lock_gap_pct", m === "lock"); show("trail_lock_target", m === "lock"); show("trail_lock_behind", m === "lock");
+  show("trail_keep_target", m !== "off" && m !== "lock");
+}
+$("trail_method").onchange = showTrailFields;
+// The lock worked through on buy 100, stop 95, target 110, from the values in the form.
+function showTrailExample() {
+  const box = $("trail-example");
+  if ($("trail_method").value !== "lock") { box.replaceChildren(); return; }
+  box.replaceChildren(...lockExampleBox({ pct: $("trail_lock_pct").value, gapPct: $("trail_lock_gap_pct").value, behind: $("trail_lock_behind").checked,
+    live: $("trail_tf").value === "live", move: $("trail_lock_target").value === "move" }));
+}
+for (const id of ["trail_method", "trail_tf", "trail_lock_pct", "trail_lock_gap_pct", "trail_lock_behind", "trail_lock_target"]) $(id).addEventListener("input", showTrailExample);
+$("trail-defaults").onclick = async () => {
+  try { S = await put({ ...TRAIL_DEFAULTS }); fill(); say("Trailing stop set to the defaults: lock, live price, step 10%, gap 20%. It applies to positions filled from now on; use Apply trailing on the Paper page for open ones."); }
+  catch (e) { say(e.message, true); }
+};
+$("trail-save").onclick = async () => {
+  const out = { trail_method: $("trail_method").value, trail_tf: $("trail_tf").value, trail_lock_target: $("trail_lock_target").value,
+    trail_keep_target: $("trail_keep_target").checked, trail_lock_behind: $("trail_lock_behind").checked };
+  for (const k of TRAIL_NUM) out[k] = Number($(k).value);
+  try { S = await put(out); fill(); say(out.trail_method === "off" ? "Trailing stop switched off. Open positions keep the settings they were filled with." : "Trailing stop saved. It applies to positions filled from now on and to new checks on the Backtest page."); }
+  catch (e) { say(e.message, true); }
+};
+$("misc-save").onclick = async () => { const out = { nse_product: $("nse_product").value }; for (const k of MISC_NUM) out[k] = Number($(k).value); for (const k of MISC_BOOL) out[k] = $(k).checked;
   try { S = await put(out); fill(); say("Settings saved."); } catch (e) { say(e.message, true); } };
 $("tg-save").onclick = async () => { const out = { telegram_chat_id: $("telegram_chat_id").value.trim(), telegram_alerts: $("telegram_alerts").checked }; if ($("telegram_token").value) out.telegram_token = $("telegram_token").value.trim();
   try { S = await put(out); $("telegram_token").value = ""; fill(); say("Telegram settings saved."); } catch (e) { say(e.message, true); } };

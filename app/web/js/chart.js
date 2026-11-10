@@ -107,6 +107,13 @@ class ZoneBands {
           ctx.font = `600 11px ${css("--font")}`; ctx.fillStyle = COLOR[z.side]; ctx.textBaseline = "top";
           ctx.fillText(`${TF_LABEL[z.tf]} ${z.side}${z.note ? ": " + z.note : ""}`, Math.max(x1, 0) + 6, Math.min(y1, y2) + 3);
         }
+        if (this.patterns && z.pattern) {     // the pattern (DBR, RBR, RBD, DBD) in the bottom-right corner of the band
+          ctx.font = `700 11px ${css("--font")}`; ctx.fillStyle = old ? COLOR.muted : COLOR[z.side]; ctx.textAlign = "right";
+          const yb = Math.max(y1, y2), tall = Math.abs(y2 - y1) >= 13;
+          ctx.textBaseline = tall ? "bottom" : "top";
+          ctx.fillText(z.pattern, Math.min(x2, mediaSize.width) - 6, tall ? yb - 2 : yb + 2);
+          ctx.textAlign = "left";
+        }
       }
       const p = this.plan;
       if (p) {      // risk and reward boxes, under the candles
@@ -169,11 +176,16 @@ function resultZones() {
   if (!r || state.replay) return [];
   const out = [], on = (id) => $(id).checked, seen = new Set();
   const add = (z, note, solid) => { if (z) out.push({ id: `r${z.zone_id}`, tf: z.timeframe, side: z.side, proximal: z.proximal, distal: z.distal, status: "fresh",
-    created: z.created_ts ? toEpoch(z.created_ts) : 0, ended: null, note, solid }); };
+    pattern: z.pattern, created: z.created_ts ? toEpoch(z.created_ts) : 0, ended: null, note, solid }); };
   const sc = (z) => (z && on("l-scores") ? `, score ${z.score} (${LABEL_TEXT[z.label] || z.label})` : "");
   if (on("l-demand")) add(r.demand_zone, `nearest HTF demand${sc(r.demand_zone)}`);
   if (on("l-supply")) add(r.supply_zone, `nearest HTF supply${sc(r.supply_zone)}`);
   if (on("l-ltf")) add(r.ltf_zone, `LTF entry zone${sc(r.ltf_zone)}`, true);
+  // Other valid LTF zones at or above the chosen score: dashed outline, lighter fill (drawn like another timeframe's zone).
+  for (const z of otherLtf(r, Number($("l-other").value)).shown)
+    out.push({ id: `o${z.zone_id}`, tf: z.timeframe, side: z.side, proximal: z.proximal, distal: z.distal, status: "fresh",
+      pattern: z.pattern, created: z.created_ts ? toEpoch(z.created_ts) : 0, ended: null, solid: false,
+      note: `other LTF zone, score ${z.score}, entry type ${(z.primary_entry || "").slice(-1)}` });
   if (on("l-contact")) for (const c of [...(r.contact_ltf || []), ...(r.contact_htf || [])]) {
     if (seen.has(c.zone_id)) continue;
     seen.add(c.zone_id);
@@ -200,6 +212,7 @@ function render() {
   const zones = showAll ? visibleZones() : [];
   const r = state.result;
   bands.scores = $("l-scores").checked;
+  bands.patterns = $("l-pattern").checked;
   bands.set(zones.concat(contactZones(), resultZones()), state.selected, state.firstTime);
   bands.setCurve(r && !state.replay && $("l-curve").checked && r.demand_zone && r.supply_zone && r.supply_zone.proximal > r.demand_zone.proximal
     ? { demand: r.demand_zone.proximal, supply: r.supply_zone.proximal, band: r.curve, rule: r.direction_rule || "location" } : null);
@@ -215,7 +228,7 @@ function render() {
       el("span", { class: "dot " + z.side }),
       el("span", { class: "lvl" }, `${z.tf ? TF_LABEL[z.tf] + ": " : ""}${fmtPrice(z.proximal)} to ${fmtPrice(z.distal)}`),
       el("span", {}, `Score ${z.score}`),
-      el("span", { class: "meta" }, `${z.side === "demand" ? "Demand" : "Supply"}, ${z.status}, ${z.touches} ${z.touches === 1 ? "test" : "tests"}, from ${fmtTime(z.created, state.tf !== "1d" && !/[wmoy]$/.test(state.tf))}`)));
+      el("span", { class: "meta" }, `${z.pattern ? z.pattern + " " : ""}${z.side === "demand" ? "demand" : "supply"}, ${z.status}, ${z.touches} ${z.touches === 1 ? "test" : "tests"}, from ${fmtTime(z.created, state.tf !== "1d" && !/[wmoy]$/.test(state.tf))}`)));
   }
 }
 
@@ -402,17 +415,23 @@ async function loadLive() {
       const back = BAR[state.tf] * (BAR[state.tf] < 86400 ? 1600 : 400);
       range = `&start=${new Date(Date.parse(state.scan + "T00:00:00Z") - back * 1000).toISOString().slice(0, 19)}&limit=7000&first=true`;
     }
-    const [candles, activeZones, oldZones, ...overlays] = await Promise.all([api(`/api/candles/${enc(state.key)}?tf=${state.tf}${range}`),
-      api(`${zoneUrl}&active_only=true`), $("show-old").checked ? api(`${zoneUrl}&inactive_only=true&limit=300`) : [],
-      ...others.map((tf) => api(`/api/zones/${enc(state.key)}?timeframe=${tf}&active_only=true`))]);
-    const zones = activeZones.concat(oldZones);
-    state.result = state.scan
-      ? await post("/api/scancheck", { symbols: [state.key], mode: state.mode, scan_date: state.scan }).then((x) => x.rows[0]).catch(() => null)
-      : await api(`/api/result/${enc(state.key)}?mode=${state.mode}`).catch(() => null);
+    let candles, zones, overlays;
+    if (state.scan) {        // a scan date: candles from well before it, and the rules as they read on that date
+      const [c, activeZones, oldZones, ...ov] = await Promise.all([api(`/api/candles/${enc(state.key)}?tf=${state.tf}${range}`),
+        api(`${zoneUrl}&active_only=true`), $("show-old").checked ? api(`${zoneUrl}&inactive_only=true&limit=300`) : [],
+        ...others.map((tf) => api(`/api/zones/${enc(state.key)}?timeframe=${tf}&active_only=true`))]);
+      candles = c; zones = activeZones.concat(oldZones); overlays = ov;
+      state.result = await post("/api/scancheck", { symbols: [state.key], mode: state.mode, scan_date: state.scan }).then((x) => x.rows[0]).catch(() => null);
+    } else {                 // live: candles, zones, other timeframes' zones and the saved result in one request
+      const d = await api(`/api/chart/${enc(state.key)}?tf=${state.tf}&mode=${state.mode}&limit=1500&old=${$("show-old").checked}&overlays=${others.join(",")}`);
+      candles = d.candles; zones = d.zones.concat(d.old); overlays = others.map((tf) => d.overlays[tf] || []); state.result = d.result;
+    }
     renderResult();
     const data = candles.map((c) => ({ time: toEpoch(c.ts), open: c.open, high: c.high, low: c.low, close: c.close }));
     series.setData(data);
     state.lastBars = data;
+    state.forming = null;
+    if (!state.scan) loadForming();
     state.firstTime = data.length ? data[0].time : null;
     if (!data.length) { render(); notice(`No ${TF_LABEL[state.tf]} candles stored for this instrument. Open the Data page and sync it.`); return; }
     notice("");
@@ -433,6 +452,26 @@ async function loadLive() {
     render();
   } catch (e) { series.setData([]); render(); notice(`Could not load the chart. ${e.message}`); }
 }
+
+// ---- the candle still forming (drawn only) ------------------------------
+// During market hours the running candle of the chosen timeframe is drawn faintly and follows the live price every
+// 5 seconds. It is never stored and never used to find or test a zone. When its period ends, the chart reloads so
+// the candle that has just closed comes from the stored candles.
+const FORMING_MS = 5000;
+async function loadForming() {
+  if (state.scan || state.replay || state.play || !state.lastBars || !state.lastBars.length) return;
+  let d;
+  try { d = await api(`/api/forming/${enc(state.key)}?tf=${state.tf}`); } catch (e) { return; }
+  const c = d && d.candle;
+  if (!c) { if (state.forming) { state.forming = null; series.setData(state.lastBars); } return; }
+  const time = toEpoch(c.ts), last = state.lastBars[state.lastBars.length - 1];
+  if (time <= last.time) return;                                       // already stored as a closed candle
+  if (state.forming && time > state.forming.time) { loadLive(); return; }   // a new period: the last one has closed
+  state.forming = { time, open: c.open, high: c.high, low: c.low, close: c.close, color: "rgba(160,174,192,0.45)",
+    wickColor: "rgba(160,174,192,0.6)", borderColor: "rgba(160,174,192,0.8)" };
+  series.update(state.forming);
+}
+setInterval(() => { if (!document.hidden && $("l-forming").checked) loadForming(); }, FORMING_MS);
 
 // ---- replay mode -------------------------------------------------------
 function replayUi(on) {
@@ -593,7 +632,9 @@ $("replay-next").onclick = () => {
 $("replay-exit").onclick = () => { if (state.play) { stopPlay(); replayUi(false); loadLive(); return; } if (state.replay) state.replay.close(); };
 $("show-old").onchange = () => { if (state.replay) render(); else loadLive(); };
 $("show-demand").onchange = render; $("show-supply").onchange = render;
-for (const id of ["l-demand", "l-supply", "l-curve", "l-ltf", "l-entry", "l-stop", "l-target", "l-contact", "l-all", "l-scan", "l-scores"]) $(id).onchange = render;
+for (const id of ["l-demand", "l-supply", "l-curve", "l-ltf", "l-entry", "l-stop", "l-target", "l-contact", "l-all", "l-scan", "l-scores", "l-pattern"]) $(id).onchange = render;
+$("l-forming").onchange = () => { if ($("l-forming").checked) loadForming(); else if (state.forming) { state.forming = null; series.setData(state.lastBars); } };
+buildOtherLtf($("l-other"), "zoneScanner.chartOtherLtf", () => render());
 // A scan date shows the result as it stood on that date, and replay then starts from it.
 function setScan(day) {
   state.scan = day || null;

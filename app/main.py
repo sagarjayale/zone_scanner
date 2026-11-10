@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from contextlib import asynccontextmanager
 import csv
 import io
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from pathlib import Path
 
@@ -15,17 +15,22 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+import logging
 import os
+import time
 
 from . import config, live, settings_store, status
 from .alerts import telegram
 from .data import indices
+from .data import forming
 from .data import sync as data_sync
 from .db import SessionLocal, engine, ensure_database, ensure_schema, get_db
 from .engine import plan as plans
 from .engine import confirm
+from .engine import eye
 from .engine import result as results
 from .jobs import scheduler as jobs
+from .jobs import scanpool
 from .jobs.runner import run_job, start_job
 from .engine import scanner
 from .engine.link import ACTIVE
@@ -35,8 +40,15 @@ from .options import chain as options
 from .sim import backtest as bt
 from .sim import scancheck
 from .sim import paper
+from .sim import trailing
+from .sim import optionpaper
+from .models import OptionPaperTrade
+from .engine import costs
 from .sim.replay import SESSIONS, ReplaySession
 from .upstox.client import TokenMissing, UpstoxClient, UpstoxError
+
+
+log = logging.getLogger("zone_scanner")
 
 
 def current_token() -> str:
@@ -105,6 +117,17 @@ def reset_zones(db: Session, earlier: str | None = None) -> None:
     db.commit()
 
 
+def _fill_counts() -> None:
+    """Candle counts kept with each sync row, for rows saved before this version: counted once, in the background."""
+    try:
+        with SessionLocal() as db:
+            n = data_sync.fill_missing_counts(db)
+        if n:
+            log.info("candle counts filled in for %d timeframes", n)
+    except Exception:
+        log.exception("could not fill in the candle counts; the Data page shows 0 until the next sync")
+
+
 async def rescan_all() -> None:
     """After the rules changed: empty the zone tables, then find every zone again from the stored candles, in the
     background. No download is needed. The setting rules_reset_pending stays on until this has finished, so an app that
@@ -151,9 +174,11 @@ async def lifespan(app: FastAPI):
         asyncio.get_running_loop().create_task(rescan_all())
     if sched and not rebuilt:   # zones used up long ago are cleared in the background (not while the rebuild empties the tables)
         asyncio.get_running_loop().create_task(asyncio.to_thread(jobs.prune_old_zones))
+    asyncio.get_running_loop().create_task(asyncio.to_thread(_fill_counts))   # once: candle counts for the Data page
     yield
     if sched:
         sched.shutdown(wait=False)
+    scanpool.shutdown()
     task = live.state.get("task")
     if task:
         task.cancel()
@@ -161,6 +186,19 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Zone scanner", version="0.4", lifespan=lifespan)
+
+SLOW_SECONDS = 1.0
+
+
+@app.middleware("http")
+async def slow_requests(request, call_next):
+    """Every API call slower than SLOW_SECONDS is written to the log with its time, so a slow page can be traced."""
+    began = time.perf_counter()
+    response = await call_next(request)
+    took = time.perf_counter() - began
+    if took > SLOW_SECONDS and request.url.path.startswith("/api/"):
+        log.warning("slow request: %s %s took %.2f s", request.method, request.url.path + (f"?{request.url.query}" if request.url.query else ""), took)
+    return response
 WEB = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
@@ -183,6 +221,11 @@ async def _upstox_failed(request, exc):
 @app.get("/paper", include_in_schema=False)
 def paper_page():
     return FileResponse(WEB / "paper.html")
+
+
+@app.get("/option-paper", include_in_schema=False)
+def option_paper_page():
+    return FileResponse(WEB / "optionpaper.html")
 
 
 @app.get("/options", include_in_schema=False)
@@ -213,6 +256,58 @@ def backtest_page():
 @app.get("/data", include_in_schema=False)
 def data_page():
     return FileResponse(WEB / "data.html")
+
+
+@app.get("/eye", include_in_schema=False)
+def eye_page():
+    return FileResponse(WEB / "eye.html")
+
+
+@app.get("/premium", include_in_schema=False)
+def premium_page():
+    return FileResponse(WEB / "premium.html")
+
+
+_EYE_BUILDING: set[str] = set()
+
+
+async def _store_eye_missing(keys: list[str]) -> None:
+    """EYE rows of stocks scanned before these rows existed: saved in the scan workers, in the background."""
+    for key in keys:
+        try:
+            await scanpool.call(key, scanner.store_eye, key)
+        except Exception:
+            log.exception("could not save the GTF EYE rows of %s", key)
+        finally:
+            _EYE_BUILDING.discard(key)
+
+
+def _eye_board(mode: str) -> tuple[dict, list[str]]:
+    with SessionLocal() as db:
+        keys = status.ready_keys(db, universe(db))
+        approach = float(settings_store.get(db, "approach_pct") or 1.0)
+        th = settings_store.thresholds(db, config.MODES[mode][0])
+        rows, missing = eye.scan(db, keys, mode, live.state["prices"], approach, th)
+        return {"mode": mode, "frames": list(config.MODES[mode]), "approach_pct": approach, "react_candles": eye.REACT_CANDLES,
+                "react_max_r": eye.REACT_MAX_R, "max_tests": int(th["max_wick_tests"]), "rows": rows,
+                "waiting": len(missing)}, missing
+
+
+@app.get("/api/eye", tags=["scan"])
+async def eye_list(mode: str = "DAILY"):
+    """GTF EYE and Premium pages: for every stock of the list, where the price stands against its HTF demand and
+    supply zones of the mode (in the zone, reacting from it, approaching it), its daily ATR %, its at-the-money IV and
+    IV percentile when it has options, and the saved GTF signal. Read from the rows each scan saves, in one query; only
+    the live price is applied here. Stocks with no saved row yet are counted in "waiting" and saved in the background."""
+    mode = mode.upper()
+    if mode not in eye.EYE_MODES:
+        raise HTTPException(400, f"mode must be one of {list(eye.EYE_MODES)}")
+    board, missing = await asyncio.to_thread(_eye_board, mode)
+    new = [k for k in missing if k not in _EYE_BUILDING]
+    if new:
+        _EYE_BUILDING.update(new)
+        asyncio.get_running_loop().create_task(_store_eye_missing(new))
+    return board
 
 
 def row(obj) -> dict:
@@ -310,11 +405,10 @@ async def data_sync_one(symbol: str, db: Session = Depends(get_db)):
 
 @app.get("/api/data/status", tags=["data"])
 def data_status(db: Session = Depends(get_db)):
-    counts = dict(((k, tf), n) for k, tf, n in db.execute(
-        select(Candle.instrument_key, Candle.timeframe, func.count()).group_by(Candle.instrument_key, Candle.timeframe)))
+    """Per instrument and timeframe: candles stored (kept at each sync, never counted here), last candle, gaps."""
     states = db.scalars(select(SyncState).order_by(SyncState.instrument_key)).all()
-    return {"api_calls": client.throttle.used(), "status": status.overview(db, universe(db)),
-            "rows": [{**row(s), "candles": counts.get((s.instrument_key, s.timeframe), 0)} for s in states]}
+    return {"api_calls": client.throttle.used(), "status": status.overview(db, universe(db)), "scan_workers": scanpool.workers(),
+            "rows": [{**row(s), "candles": s.candles or 0} for s in states]}
 
 
 @app.get("/api/candles/{symbol:path}", tags=["data"])
@@ -329,6 +423,45 @@ def candles(symbol: str, tf: str = "1d", start: datetime | None = None, end: dat
         df = data_sync.load_candles(db, resolve(db, symbol), tf, since=start, until=end, last=limit)
     df["ts"] = df["ts"].astype(str) if not df.empty else df["ts"]
     return df.to_dict("records")
+
+
+@app.get("/api/chart/{symbol:path}", tags=["data"])
+def chart_data(symbol: str, tf: str = "1d", mode: str = "MONTHLY", limit: int = Query(1500, le=8000), old: bool = False,
+               overlays: str = "", result: bool = True, db: Session = Depends(get_db)):
+    """Everything the chart draws, in one request: the newest candles, the active zones of the timeframe (and the newest
+    300 used-up ones with old=true), the active zones of the other timeframes named in overlays (comma separated), and
+    the mode's saved result."""
+    if tf not in config.TIMEFRAMES:
+        raise HTTPException(400, f"timeframe must be one of {config.TIMEFRAMES}")
+    key = resolve(db, symbol)
+    df = data_sync.load_candles(db, key, tf, last=limit)
+    df["ts"] = df["ts"].astype(str) if not df.empty else df["ts"]
+    q = select(Zone).where(Zone.instrument_key == key, Zone.timeframe == tf)
+    active = [row(z) for z in db.scalars(q.where(Zone.status.in_(ACTIVE)).order_by(Zone.created_ts.desc())).all()]
+    used = [row(z) for z in db.scalars(q.where(Zone.status.notin_(ACTIVE)).order_by(Zone.created_ts.desc()).limit(300)).all()] if old else []
+    extra = {}
+    for otf in [t for t in overlays.split(",") if t and t != tf and t in config.TIMEFRAMES]:
+        extra[otf] = [row(z) for z in db.scalars(select(Zone).where(Zone.instrument_key == key, Zone.timeframe == otf, Zone.status.in_(ACTIVE))
+                                                 .order_by(Zone.created_ts.desc())).all()]
+    res = None
+    if result and mode.upper() in config.MODES:
+        names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key == key)).all())
+        res = _result_row(db, key, mode.upper(), names)
+    return {"instrument_key": key, "candles": df.to_dict("records"), "zones": active, "old": used, "overlays": extra, "result": res}
+
+
+@app.get("/api/forming/{symbol:path}", tags=["data"])
+def forming_candle(symbol: str, tf: str = "1d", db: Session = Depends(get_db)):
+    """The candle still forming on this timeframe, from the stored 5 minute candles of the period and the live price.
+    For drawing only: it is never stored and never used to find or test a zone. None when the market is closed."""
+    if tf not in config.TIMEFRAMES:
+        raise HTTPException(400, f"timeframe must be one of {config.TIMEFRAMES}")
+    key = resolve(db, symbol)
+    now = data_sync.now_ist()
+    if not live.market_open(now):
+        return {"candle": None, "market_open": False}
+    c = forming.candle(db, key, tf, live.state["prices"].get(key), now, bool(settings_store.get(db, "fiscal_year")))
+    return {"candle": c, "market_open": True}
 
 
 @app.post("/api/instruments/refresh", tags=["data"])
@@ -354,6 +487,12 @@ async def scan_run(db: Session = Depends(get_db)):
 
     async def work(d, report):
         await jobs.each_instrument(keys, lambda key: jobs.prepare(client, key, download=False), report)
+        auto = await jobs.auto_after_scan()          # market closed: automatic orders from this scan, if switched on
+        if auto and auto["placed"]:
+            report(f"{len(keys)} instruments scanned, {len(auto['placed'])} paper orders placed (market closed)")
+        opt = await jobs.option_auto_after_scan(client)
+        if opt and opt["placed"]:
+            report(f"{len(keys)} instruments scanned, {len(opt['placed'])} option paper orders placed (market closed)")
     return {"job_id": start_job("scan", work), "symbols": len(keys)}
 
 
@@ -369,7 +508,7 @@ async def scan_one(symbol: str, sync: bool = True, db: Session = Depends(get_db)
             raise HTTPException(401, str(exc))
         except UpstoxError as exc:
             raise HTTPException(502, str(exc))
-    stats = await asyncio.to_thread(scanner.scan_key, key, True)
+    stats = await scanpool.scan(key, True)
     status.mark(db, key, "ready")
     return {"instrument_key": key, "synced": synced, "scan": stats}
 
@@ -487,6 +626,64 @@ def settings_get(db: Session = Depends(get_db)):
     return out
 
 
+def _check_trailing(values: dict) -> None:
+    """The trailing stop settings from the Settings page."""
+    if values.get("trail_method") is not None and values["trail_method"] not in trailing.METHODS:
+        raise HTTPException(400, f"trail_method must be one of {list(trailing.METHODS)}.")
+    if values.get("trail_tf") is not None and values["trail_tf"] not in trailing.TIMEFRAMES:
+        raise HTTPException(400, "trail_tf must be 'live', 'ltf' or 'itf'.")
+    if values.get("trail_lock_target") is not None and values["trail_lock_target"] not in trailing.LOCK_TARGET:
+        raise HTTPException(400, "trail_lock_target must be 'move' or 'close'.")
+    for k in ("trail_keep_target", "trail_lock_behind"):
+        if values.get(k) is not None and not isinstance(values[k], bool):
+            raise HTTPException(400, f"{k} must be true or false.")
+    ranges = {"trail_start_r": (0.25, 10, "Start trailing at must be from 0.25 to 10 R."),
+              "trail_atr_mult": (0.5, 10, "ATR multiple must be from 0.5 to 10."),
+              "trail_swing": (1, 5, "Swing candles must be from 1 to 5."),
+              "trail_lock_pct": (1, 100, "Lock step must be from 1 to 100%."),
+              "trail_lock_gap_pct": (0, 100, "Lock gap must be from 0 to 100% of a step.")}
+    for k, (lo, hi, msg) in ranges.items():
+        if values.get(k) is not None:
+            try:
+                v = float(values[k])
+            except (TypeError, ValueError):
+                raise HTTPException(400, msg)
+            if not lo <= v <= hi or (k == "trail_swing" and v != int(v)):
+                raise HTTPException(400, msg)
+
+
+def _check_option_paper(values: dict) -> None:
+    """The option paper settings."""
+    if values.get("opt_strike_rule") is not None and values["opt_strike_rule"] not in optionpaper.RULES:
+        raise HTTPException(400, f"opt_strike_rule must be one of {list(optionpaper.RULES)}.")
+    for k in ("opt_auto", "opt_auto_closed"):
+        if values.get(k) is not None and not isinstance(values[k], bool):
+            raise HTTPException(400, f"{k} must be true or false.")
+    if values.get("opt_expiry_close") is not None:
+        t = str(values["opt_expiry_close"])
+        try:
+            h, m = t.split(":")
+            ok = 9 <= int(h) <= 15 and 0 <= int(m) <= 59 and len(m) == 2 and (int(h), int(m)) <= (15, 29)
+        except ValueError:
+            ok = False
+        if not ok:
+            raise HTTPException(400, "opt_expiry_close must be a time from 09:15 to 15:29, like 15:15.")
+    ranges = {"opt_paper_capital": (10000, 1e9, "Option capital must be from 10,000 to 100 crore."),
+              "opt_paper_risk_pct": (0.1, 10, "Option risk per trade must be from 0.1 to 10%."),
+              "opt_min_days": (0, 60, "Minimum days to expiry must be from 0 to 60."),
+              "opt_max_premium_pct": (1, 100, "Max premium per trade must be from 1 to 100%."),
+              "opt_auto_min_score": (0, 10, "Automatic score must be from 0 to 10."),
+              "opt_premium_stop_pct": (0, 95, "Premium stop must be from 0 (off) to 95%.")}
+    for k, (lo, hi, msg) in ranges.items():
+        if values.get(k) is not None:
+            try:
+                v = float(values[k])
+            except (TypeError, ValueError):
+                raise HTTPException(400, msg)
+            if not lo <= v <= hi or (k == "opt_min_days" and v != int(v)):
+                raise HTTPException(400, msg)
+
+
 @app.put("/api/settings", tags=["system"])
 async def settings_put(values: dict = Body(...), db: Session = Depends(get_db)):
     """Save thresholds, the stock list (key 'universe'), per-timeframe overrides (key 'thresholds:<tf>'),
@@ -496,12 +693,43 @@ async def settings_put(values: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(400, "direction_rule must be 'location' or 'trend'.")
     if "marking_rule" in values and values["marking_rule"] not in ("scanner", "pdf"):
         raise HTTPException(400, "marking_rule must be 'scanner' or 'pdf'.")
+    if "nse_product" in values and values["nse_product"] not in ("delivery", "intraday"):
+        raise HTTPException(400, "nse_product must be 'delivery' or 'intraday'.")
     if "htf_zone_pick" in values and values["htf_zone_pick"] not in ("fresh", "any"):
         raise HTTPException(400, "htf_zone_pick must be 'fresh' or 'any'.")
     if "zone_history" in values and values["zone_history"] not in ("scanner", "all"):
         raise HTTPException(400, "zone_history must be 'scanner' or 'all'.")
     if "entry_23" in values and values["entry_23"] not in ("TYPE_2", "TYPE_3"):
         raise HTTPException(400, "entry_23 must be 'TYPE_2' or 'TYPE_3'.")
+    for k in ("ltf_min_bases", "ltf_max_bases"):
+        if k in values:
+            try:
+                n = float(values[k])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{k} must be a whole number from 0 to 20.")
+            if n != int(n) or not 0 <= n <= 20:
+                raise HTTPException(400, f"{k} must be a whole number from 0 to 20.")
+            values[k] = int(n)
+    if int(values.get("ltf_min_bases", 0) or 0) and int(values.get("ltf_max_bases", 0) or 0) \
+            and int(values["ltf_min_bases"]) > int(values["ltf_max_bases"]):
+        raise HTTPException(400, "The minimum base candles cannot be more than the maximum.")
+    if "itf_rule" in values and values["itf_rule"] not in ("pct", "atr"):
+        raise HTTPException(400, "itf_rule must be 'pct' or 'atr'.")
+    for k, lo, hi in (("min_stop_pct", 0, 20), ("itf_slope_pct", 0.001, 5), ("itf_atr_mult", 0.01, 5)):
+        if k in values:
+            try:
+                v = float(values[k])
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{k} must be a number from {lo} to {hi}.")
+            if not lo <= v <= hi:
+                raise HTTPException(400, f"{k} must be a number from {lo} to {hi}.")
+    for k in ("skip_reaction_zones", "check_next_htf", "paper_auto_closed"):
+        if k in values and not isinstance(values[k], bool):
+            raise HTTPException(400, f"{k} must be true or false.")
+    _check_trailing(values)
+    _check_option_paper(values)
+    if any(k.startswith("opt_") or k in ("paper_risk_pct",) for k in values):
+        optionpaper._previews.clear()             # the option shown for each signal follows the new settings
     before = set(universe(db))
     for k, v in values.items():
         if k in ("access_token", "token_time"):
@@ -577,16 +805,17 @@ async def scan_rebuild(db: Session = Depends(get_db)):
     Use it after changing thresholds. Candles are kept; paper positions are kept."""
     keys = universe(db)
 
-    def rebuild(key: str):
+    def clear(key: str):
         with SessionLocal() as own:
             scanner.clear_key(own, key)
-        return scanner.scan_key(key, True)
 
     async def work(d, report):
-        for n, key in enumerate(keys, 1):
-            await asyncio.to_thread(rebuild, key)
-            status.mark(d, key, "ready")
-            report(f"{n} of {len(keys)} instruments rebuilt")
+        async def one(key: str):
+            await asyncio.to_thread(clear, key)
+            await scanpool.scan(key, True)          # several stocks at once on MySQL (scan workers)
+            with SessionLocal() as own:
+                status.mark(own, key, "ready")
+        await jobs.each_instrument(keys, one, report, "instruments rebuilt")
     return {"job_id": start_job("rebuild zones", work), "symbols": len(keys)}
 
 
@@ -722,8 +951,223 @@ def backtest_export(run_id: int, db: Session = Depends(get_db)):
                     headers={"Content-Disposition": f'attachment; filename="backtest_{run_id}.csv"'})
 
 
+@app.delete("/api/backtest/{run_id}", tags=["backtest"])
+def backtest_delete(run_id: int, db: Session = Depends(get_db)):
+    """Delete a finished backtest run and its trades. A run still going must be cancelled first.
+    Saved scan-date checks are deleted with DELETE /api/scancheck/{id}."""
+    r = db.get(BacktestRun, run_id)
+    if not r or _is_scan(r):
+        raise HTTPException(404, "No such backtest run")
+    if r.status == "running":
+        raise HTTPException(400, "This run is still going. Cancel it first.")
+    db.execute(delete(BacktestTrade).where(BacktestTrade.run_id == run_id))
+    db.delete(r)
+    db.commit()
+    return {"deleted": run_id}
+
+
+def _csv(rows: list[list], header: list[str], filename: str) -> Response:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    w.writerows(rows)
+    return Response(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+def _duration(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    m = int(seconds // 60)
+    d, rest = divmod(m, 1440)
+    h, m = divmod(rest, 60)
+    return (f"{d}d " if d else "") + f"{h}h {m:02d}m"
+
+
+PAPER_CSV = ["id", "symbol", "mode", "timeframe", "side", "quantity", "entry_type", "signal_ts", "placed_at", "waited", "fill_ts",
+             "fill_price", "first_stop", "stop", "target", "exit_ts", "exit_price", "exit_reason", "duration", "pnl", "charges",
+             "pnl_after_charges", "result", "result_r", "stop_moves", "trail_method", "kind", "label"]
+
+
+@app.get("/api/paper/export", tags=["paper"])
+def paper_export(db: Session = Depends(get_db)):
+    """Closed paper trades (not reset ones) as CSV, newest first. Times are IST, as stored. stop is the stop at the
+    exit; first_stop the one the trade was filled with (they differ when a trailing stop moved it)."""
+    trades = db.scalars(select(PaperTrade).where(PaperTrade.exit_ts.isnot(None), PaperTrade.archived.isnot(True))
+                        .order_by(PaperTrade.exit_ts.desc())).all()
+    keys = {t.instrument_key for t in trades}
+    names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all()) if keys else {}
+    rows = []
+    info = _order_info(db, {t.order_id for t in trades if t.order_id})
+    th = settings_store.thresholds(db, "1d")
+    for t in trades:
+        st = t.trail or {}
+        extra = row(t)
+        _add_times(extra, info.get(t.order_id, {}), th)
+        values = {"symbol": t.label or names.get(t.instrument_key) or t.instrument_key.split("|")[-1],
+                  "duration": _duration((t.exit_ts - t.fill_ts).total_seconds() if t.fill_ts else None),
+                  "waited": _duration(extra.get("waited_s")), "mode": extra.get("mode"), "entry_type": extra.get("entry_type"),
+                  "signal_ts": extra.get("signal_ts"), "placed_at": extra.get("placed_at"), "charges": extra.get("charges"),
+                  "pnl_after_charges": extra.get("pnl_after_charges"),
+                  "first_stop": st.get("first_stop", t.stop), "stop_moves": st.get("moves", 0), "trail_method": st.get("trail_method", "off")}
+        rows.append([values[c] if c in values else getattr(t, c, None) for c in PAPER_CSV])
+    return _csv(rows, PAPER_CSV, "paper_trades.csv")
+
+
+# ---------------------------------------------------------------- option paper
+OPT_SETTINGS = ("opt_paper_capital", "opt_paper_risk_pct", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_auto",
+                "opt_auto_min_score", "opt_auto_closed", "opt_expiry_close", "opt_premium_stop_pct")
+PREVIEW_LIMIT = 20          # plans in one preview request (the page asks a few at a time)
+
+
+@app.get("/api/option-paper/positions", tags=["option paper"])
+def option_paper_positions(db: Session = Depends(get_db)):
+    """The option paper account: the figures, the signals that can be traded, pending orders, open positions and closed
+    trades (the last 200), with the live prices of the stocks and the options."""
+    now = data_sync.now_ist()
+    rows = db.scalars(select(OptionPaperTrade).where(OptionPaperTrade.archived.isnot(True))
+                      .order_by(OptionPaperTrade.id.desc()).limit(400)).all()
+    views = [optionpaper.view(t, now) for t in rows]
+    pending = [v for v in views if v["status"] == "pending"]
+    opened = [v for v in views if v["status"] == "open"]
+    closed = sorted([v for v in views if v["status"] in ("closed", "cancelled")], key=lambda v: v["exit_ts"] or v["created_at"] or now, reverse=True)[:200]
+    bal = optionpaper.balance(db)
+    used = optionpaper.in_positions(db)
+    taken = {(t.zone_id, t.mode) for t in rows if t.status in optionpaper.OPEN_STATES}
+    keys = set()
+    signals = []
+    watched = live.watch_rows(db)
+    has_options = optionpaper.option_stocks(db, {z.instrument_key for z, _ in watched}, now.date())
+    for z, p in watched:
+        if z.instrument_key not in has_options:          # only stocks with options are shown here
+            continue
+        keys.add(z.instrument_key)
+        signals.append({"plan_id": p.id, "zone_id": z.id, "instrument_key": z.instrument_key, "mode": p.mode, "timeframe": z.timeframe,
+                        "signal": "BUY" if z.side == "demand" else "SELL", "score": z.score, "entry_type": p.entry_type or "TYPE_1",
+                        "entry": p.entry, "stop": p.stop, "target": p.target, "pattern": z.label, "placed": (z.id, p.mode) in taken,
+                        "price": live.state["prices"].get(z.instrument_key)})
+    names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all()) if keys else {}
+    for x in signals:
+        x["symbol"] = names.get(x["instrument_key"]) or x["instrument_key"].split("|")[-1]
+    signals.sort(key=lambda x: (x["placed"], -(x["score"] or 0), x["symbol"]))
+    return {"now": now, "market_open": live.market_open(now), "settings": {k: settings_store.get(db, k) for k in OPT_SETTINGS},
+            "summary": {"capital": float(settings_store.get(db, "opt_paper_capital")), "balance": round(bal, 2), "in_positions": round(used, 2),
+                        "free": round(bal - used, 2), "open_pnl": round(sum(v["open_pnl"] or 0 for v in opened), 2),
+                        "closed_pnl": round(sum(v["pnl_after"] or 0 for v in closed if v["status"] == "closed"), 2),
+                        "wins": sum(1 for v in closed if v["status"] == "closed" and (v["pnl_after"] or 0) > 0),
+                        "trades": sum(1 for v in closed if v["status"] == "closed")},
+            "signals": signals, "pending": pending, "open": opened, "closed": closed}
+
+
+@app.get("/api/option-paper/previews", tags=["option paper"])
+async def option_paper_previews(plan_ids: str = "", db: Session = Depends(get_db)):
+    """For the plans asked (comma-separated ids; the page asks a few at a time): the option each would get now:
+    expiry, strike, premium, estimated premiums at the stock's entry, stop and target, lots, cost and risk, or why it
+    would be skipped. From the option chain, at most every 15 minutes a plan."""
+    try:
+        ids = [int(x) for x in plan_ids.split(",") if x.strip()][:PREVIEW_LIMIT]
+    except ValueError:
+        raise HTTPException(400, "plan_ids must be numbers separated by commas.")
+    plans = [p for p in (db.get(TradePlan, i) for i in ids) if p is not None]
+    got = await optionpaper.previews(db, client, plans, data_sync.now_ist(), live.state["prices"])
+    return {str(k): v for k, v in got.items()}
+
+
+@app.post("/api/option-paper/place", tags=["option paper"])
+async def option_paper_place(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Choose the option for one watched plan (call on BUY, put on SELL) and place it as a pending order."""
+    plan = db.get(TradePlan, int(body.get("plan_id") or 0))
+    if plan is None:
+        raise HTTPException(404, "No such plan. Refresh the page: the scan may have replaced it.")
+    zone = db.get(Zone, plan.zone_id)
+    got = await optionpaper.place(db, client, plan, data_sync.now_ist(), live.state["prices"].get(zone.instrument_key) if zone else None)
+    if "skipped" in got:
+        raise HTTPException(400, got["skipped"])
+    await live.hub.broadcast({"type": "option-paper", "event": "order placed"})
+    return optionpaper.view(got["placed"], data_sync.now_ist())
+
+
+@app.post("/api/option-paper/auto/run", tags=["option paper"])
+async def option_paper_auto_run(db: Session = Depends(get_db)):
+    """Option orders now for every watched plan at or above the automatic score (from the last saved scan)."""
+    out = await optionpaper.auto_place(db, client, live.watch_rows(db), data_sync.now_ist(), live.state["prices"], force=True)
+    if out["placed"]:
+        await live.hub.broadcast({"type": "option-paper", "event": "order placed"})
+    return out
+
+
+@app.post("/api/option-paper/{trade_id}/close", tags=["option paper"])
+async def option_paper_close(trade_id: int, body: dict | None = Body(None), db: Session = Depends(get_db)):
+    """Cancel a pending order, or close an open position at the option's last price (or the price given)."""
+    price = (body or {}).get("price")
+    try:
+        t = optionpaper.close_now(db, trade_id, data_sync.now_ist(), float(price) if price not in (None, "") else None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await live.hub.broadcast({"type": "option-paper", "event": "closed"})
+    return optionpaper.view(t, data_sync.now_ist())
+
+
+@app.post("/api/option-paper/reset", tags=["option paper"])
+def option_paper_reset(db: Session = Depends(get_db)):
+    """Start the option paper account again: every order and trade is archived (kept in the database, not shown)."""
+    return {"archived": optionpaper.reset(db)}
+
+
+OPT_CSV = ["id", "symbol", "option_label", "mode", "timeframe", "signal", "score", "entry_type", "strike_rule", "lots", "quantity",
+           "created_at", "fill_ts", "fill_premium", "fill_spot", "exit_ts", "exit_premium", "exit_spot", "exit_reason", "duration",
+           "entry", "first_stop", "stop", "target", "risk_amount", "pnl", "charges", "pnl_after", "result_r"]
+
+
+@app.get("/api/option-paper/export", tags=["option paper"])
+def option_paper_export(db: Session = Depends(get_db)):
+    """Closed option paper trades as CSV, newest first. Times are IST."""
+    now = data_sync.now_ist()
+    rows = db.scalars(select(OptionPaperTrade).where(OptionPaperTrade.status == "closed", OptionPaperTrade.archived.isnot(True))
+                      .order_by(OptionPaperTrade.exit_ts.desc())).all()
+    out = []
+    for t in rows:
+        v = optionpaper.view(t, now)
+        v["duration"] = _duration(v["open_s"])
+        out.append([v.get(c) for c in OPT_CSV])
+    return _csv(out, OPT_CSV, "option_paper_trades.csv")
+
+
+SCAN_CSV = ["stock", "instrument_key", "mode", "scan_date", "price", "signal", "score", "zone_type", "reason", "curve", "itf_trend",
+            "ltf_zone", "entry_type", "status", "note", "entry_ts", "entry", "stop", "target", "exit_ts", "exit_price", "result_r",
+            "stop_moves", "final_stop"]
+
+
+@app.get("/api/scancheck/{check_id}/export", tags=["backtest"])
+def scan_check_export(check_id: int, db: Session = Depends(get_db)):
+    """One saved scan-date check as CSV: one line per stock and entry type, as the report shows it."""
+    r = db.get(BacktestRun, check_id)
+    if not r or not _is_scan(r):
+        raise HTTPException(404, "No such saved check")
+    rows = []
+    for x in (r.summary or {}).get("rows", []):
+        s, z = x.get("signal") or {}, x.get("ltf_zone")
+        zone = f"{z.get('proximal')} to {z.get('distal')}" if z else ""
+        for name, o in (x.get("outcomes") or {}).items():
+            rows.append([x.get("symbol"), x.get("instrument_key"), x.get("mode"), x.get("scan_date"), x.get("cmp"), s.get("signal"),
+                         s.get("score"), s.get("zone_type"), s.get("reason"), x.get("curve"), x.get("itf_trend"), zone, name,
+                         o.get("status"), o.get("note"), o.get("entry_ts"), o.get("entry"), o.get("stop"), o.get("target"),
+                         o.get("exit_ts"), o.get("exit_price"), o.get("result_r"), o.get("stop_moves"), o.get("final_stop")])
+    return _csv(rows, SCAN_CSV, f"scan_check_{check_id}.csv")
+
+
 # ---------------------------------------------------------------- live (3)
 ALERT_TYPES = ("alert_approaching", "alert_triggered")
+
+
+@app.get("/api/live/feed", tags=["live"])
+def live_feed():
+    """The live price feed in one small answer, for the badge in every page's header: market open, the last price
+    round and its age, and any error."""
+    now = data_sync.now_ist()
+    f = live.feed_status(now)
+    last = f["last_poll"]
+    return {"now": now, "market_open": live.market_open(now), "last_poll": last, "error": f["error"],
+            "age_s": round((now - last).total_seconds()) if last else None, "stale": f["stale"], "pages": len(live.hub.clients)}
 
 
 @app.get("/api/live/status", tags=["live"])
@@ -745,7 +1189,12 @@ def live_status(mode: str = "DAILY", db: Session = Depends(get_db)):
             price = float(last["close"].iloc[-1]) if not last.empty else None
         row_ = {"instrument_key": key, "symbol": names.get(key) or key.split("|")[-1], "price": price,
                 "curve": None, "itf_trend": None, "htf_trend": None, "market_state": None, "side": "NONE"}
-        if price is not None:
+        saved = db.get(ModeResult, (key, mode))       # what the last scan said: read, never worked out here
+        if saved is not None and saved.data:
+            d = saved.data
+            row_.update(curve=d.get("curve"), itf_trend=d.get("itf_trend"), htf_trend=d.get("htf_trend"),
+                        market_state=d.get("market_state"), side=d.get("trade_side") or "NONE")
+        elif price is not None:
             ctx = plans.mode_context(db, key, mode, price, now)
             row_.update({k: ctx[k] for k in ("curve", "itf_trend", "htf_trend", "market_state", "side")})
         bias.append(row_)
@@ -791,13 +1240,40 @@ def _paper_error(exc: ValueError):
     raise HTTPException(400, str(exc))
 
 
-def _trade_view(t: PaperTrade, names: dict) -> dict:
+def _trade_view(t: PaperTrade, names: dict, ticks: dict | None = None, th: dict | None = None) -> dict:
     price = live.state["prices"].get(t.instrument_key)
     sign = 1 if t.side == "demand" else -1
     out = row(t)
     out.update(symbol=t.label or names.get(t.instrument_key) or t.instrument_key.split("|")[-1], price=price,
-               open_pnl=round((price - t.fill_price) * sign * t.quantity, 2) if price is not None and t.exit_ts is None else None)
+               open_pnl=round((price - t.fill_price) * sign * t.quantity, 2) if price is not None and t.exit_ts is None else None,
+               tick=(ticks or {}).get(t.instrument_key) or DEFAULT_TICK)
+    if t.exit_ts is None and t.kind != "option":
+        out["trail_view"] = _trail_view(t, th or {})
     return out
+
+
+DEFAULT_TICK = 0.05     # NSE equity tick, used until the instrument's own tick size is stored
+
+
+def _trail_view(t: PaperTrade, th: dict) -> dict:
+    """What the Paper page shows about an open position's stop: the stop locked so far in R and in rupees (before and
+    after the NSE round-trip charges at the stop), and for the lock method the full step ladder."""
+    st = t.trail or {}
+    sign = 1 if t.side == "demand" else -1
+    first_stop = float(st.get("first_stop", t.stop))
+    risk = float(t.risk or abs(t.fill_price - first_stop)) or None
+    gone = (float(t.stop) - float(t.fill_price)) * sign
+    qty = int(t.quantity or 0)
+    after = None
+    if qty > 0:
+        buy, sell = (t.fill_price, t.stop) if sign > 0 else (t.stop, t.fill_price)
+        after = round(gone * qty - costs.round_trip(buy * qty, sell * qty, th), 2)
+    view = {"method": st.get("trail_method") or "off", "moves": int(st.get("moves") or 0), "first_stop": first_stop, "risk": risk,
+            "locked_r": round(gone / risk, 2) if risk else None, "locked_inr": round(gone * qty, 2), "locked_after_charges": after,
+            "best": st.get("best"), "tf": st.get("tf"), "live": st.get("trail_tf") == "live"}
+    if view["method"] == "lock" and st.get("first_target") is not None:
+        view.update(trailing.ladder(t.side, t.fill_price, first_stop, float(st["first_target"]), st, t.stop, t.target, st.get("best")))
+    return view
 
 
 @app.post("/api/paper/orders", tags=["paper"])
@@ -829,15 +1305,114 @@ def paper_cancel(order_id: int, db: Session = Depends(get_db)):
         _paper_error(exc)
 
 
+@app.post("/api/paper/auto/run", tags=["paper"])
+async def paper_auto_run():
+    """"Place automatic orders now": from the last saved scan (no download, no new scan), with the checks of automatic
+    orders (fresh zone, score at least the auto score, the mode's best zone, no order yet). Works with the market open
+    or closed. Returns the orders placed and the setups skipped with the reason."""
+    now = data_sync.now_ist()
+
+    def work() -> dict:
+        with SessionLocal() as db:
+            note = None if live.market_open(now) else jobs.closed_note(now)
+            out = paper.auto_run(db, live.watch_rows(db), now, note)
+            keys = {x["instrument_key"] for x in out["placed"] + out["skipped"]}
+            names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all()) if keys else {}
+            for x in out["placed"] + out["skipped"]:
+                x["symbol"] = names.get(x["instrument_key"]) or x["instrument_key"].split("|")[-1]
+            return {**out, "market_open": live.market_open(now)}
+    out = await asyncio.to_thread(work)
+    if out["placed"]:
+        await live.hub.broadcast({"type": "paper", "event": "order placed"})
+    return out
+
+
 @app.get("/api/paper/positions", tags=["paper"])
 def paper_positions(db: Session = Depends(get_db)):
-    names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.segment.in_(("NSE_EQ", "NSE_INDEX")))).all())
-    pending = [{**row(o), "symbol": names.get(o.instrument_key) or o.instrument_key.split("|")[-1],
-                "price": live.state["prices"].get(o.instrument_key)} for o in paper.live_orders(db)]
+    orders, opened = paper.live_orders(db), paper.open_trades(db)
     closed = db.scalars(select(PaperTrade).where(PaperTrade.exit_ts.isnot(None), PaperTrade.archived.isnot(True))
                         .order_by(PaperTrade.exit_ts.desc()).limit(200)).all()
-    return {"pending": pending, "open": [_trade_view(t, names) for t in paper.open_trades(db)],
-            "closed": [_trade_view(t, names) for t in closed]}
+    keys = {x.instrument_key for x in [*orders, *opened, *closed]}       # names of these instruments only
+    found = db.execute(select(Instrument.instrument_key, Instrument.symbol, Instrument.tick_size).where(Instrument.instrument_key.in_(keys))).all() if keys else []
+    names = {k: s for k, s, _ in found}
+    ticks = {k: tk for k, _, tk in found if tk}
+    zones = {z.id: z for z in db.scalars(select(Zone).where(Zone.id.in_({o.zone_id for o in orders})))} if orders else {}
+    pending = [{**row(o), "symbol": names.get(o.instrument_key) or o.instrument_key.split("|")[-1], "tick": ticks.get(o.instrument_key) or DEFAULT_TICK,
+                "price": live.state["prices"].get(o.instrument_key), "wait": _wait_status(o, zones.get(o.zone_id))} for o in orders]
+    th = settings_store.thresholds(db, "1d")       # NSE charges, for "after charges"
+    now = data_sync.now_ist()
+    # The last stored close of each instrument on the page: shown when there is no live price (market closed, or the
+    # app just started). Only for drawing; fills always come from live prices or new candles.
+    last = _last_closes(db, {o.instrument_key for o in orders} | {t.instrument_key for t in opened if t.kind != "option"})
+    for o in pending:
+        o["last_close"], o["last_close_ts"] = last.get(o["instrument_key"], (None, None))
+    open_rows = [_trade_view(t, names, ticks, th) for t in opened]
+    for t in open_rows:
+        t["last_close"], t["last_close_ts"] = last.get(t["instrument_key"], (None, None))
+    closed_rows = [_trade_view(t, names, ticks, th) for t in closed]
+    info = _order_info(db, {o.id for o in orders} | {t.order_id for t in [*opened, *closed] if t.order_id})
+    for o in pending:
+        o.update(info.get(o["id"], {}))
+    for t in open_rows + closed_rows:
+        _add_times(t, info.get(t.get("order_id"), {}), th)
+    return {"pending": pending, "open": open_rows, "closed": closed_rows, "market_open": live.market_open(now), "now": now}
+
+
+def _order_info(db: Session, order_ids: set) -> dict[int, dict]:
+    """For each paper order: the mode of its plan, when the order was placed and when the plan's signal came."""
+    order_ids = {i for i in order_ids if i}
+    if not order_ids:
+        return {}
+    orders = db.execute(select(PaperOrder.id, PaperOrder.plan_id, PaperOrder.created_at, PaperOrder.entry_type)
+                        .where(PaperOrder.id.in_(order_ids))).all()
+    plans = {pid: (mode, ts) for pid, mode, ts in db.execute(select(TradePlan.id, TradePlan.mode, TradePlan.created_ts)
+                                                              .where(TradePlan.id.in_({o[1] for o in orders}))).all()}
+    out = {}
+    for oid, pid, placed, etype in orders:
+        mode, signal = plans.get(pid, (None, None))
+        out[oid] = {"mode": mode, "placed_at": placed, "signal_ts": signal, "entry_type": etype or "TYPE_1"}
+    return out
+
+
+def _add_times(t: dict, info: dict, th: dict) -> None:
+    """A position's mode and timeframe, how long its order waited for the fill, how long it has been (or was) open,
+    and for a closed trade the NSE charges of the round trip (the profit or loss shown is before them)."""
+    t["mode"], t["signal_ts"], t["placed_at"] = info.get("mode"), info.get("signal_ts"), info.get("placed_at")
+    t["entry_type"] = info.get("entry_type")
+    fill, placed, exit_ = t.get("fill_ts"), info.get("placed_at"), t.get("exit_ts")
+    t["waited_s"] = (fill - placed).total_seconds() if fill and placed and fill >= placed else None
+    end = exit_ or data_sync.now_ist()
+    t["open_s"] = (end - fill).total_seconds() if fill else None
+    if exit_ and t.get("kind") != "option" and t.get("quantity") and t.get("exit_price") is not None:
+        qty, sign = int(t["quantity"]), 1 if t["side"] == "demand" else -1
+        buy, sell = (t["fill_price"], t["exit_price"]) if sign > 0 else (t["exit_price"], t["fill_price"])
+        t["charges"] = round(costs.round_trip(buy * qty, sell * qty, th), 2)
+        t["pnl_after_charges"] = round((t.get("pnl") or 0) - t["charges"], 2)
+
+
+def _last_closes(db: Session, keys: set[str]) -> dict[str, tuple[float, datetime]]:
+    """The last stored close per instrument: the newest 5 minute candle, or the newest daily candle when there is none."""
+    out = {}
+    for key in keys:
+        for tf in ("5m", "1d"):
+            got = db.execute(select(Candle.close, Candle.ts).where(Candle.instrument_key == key, Candle.timeframe == tf)
+                             .order_by(Candle.ts.desc()).limit(1)).first()
+            if got is not None:
+                ts = got[1] + timedelta(minutes=5) if tf == "5m" else got[1]     # a 5 minute candle closes 5 minutes after it opens
+                out[key] = (float(got[0]), ts)
+                break
+    return out
+
+
+def _wait_status(o: PaperOrder, z: Zone | None) -> str | None:
+    """Entry types 2 and 3 do not fill on a touch: where the zone stands for their entry."""
+    if (o.entry_type or "TYPE_1") == "TYPE_1":
+        return None
+    if z is not None and z.inside_armed:
+        return "Armed: a candle closed inside the zone, the next candle can enter"
+    if z is not None and z.in_visit:
+        return "Price is in the zone: waits for a candle to close inside it"
+    return "Waits for a candle to close inside the zone"
 
 
 @app.patch("/api/paper/positions/{trade_id}", tags=["paper"])
@@ -846,6 +1421,60 @@ def paper_edit(trade_id: int, stop: float | None = Body(None), target: float | N
         return row(paper.edit(db, trade_id, stop, target, data_sync.now_ist()))
     except ValueError as exc:
         _paper_error(exc)
+
+
+@app.post("/api/paper/positions/{trade_id}/trail", tags=["paper"])
+def paper_apply_trailing(trade_id: int, db: Session = Depends(get_db)):
+    """Give an open zone position the trailing stop of the Settings page now, from its current stop and target."""
+    try:
+        return row(paper.apply_trailing(db, trade_id, data_sync.now_ist()))
+    except ValueError as exc:
+        _paper_error(exc)
+
+
+@app.post("/api/paper/orders/{order_id}/enter", tags=["paper"])
+async def paper_enter_now(order_id: int, db: Session = Depends(get_db)):
+    """Fill a pending order now at the live market price (plus slippage), during market hours. Paper only."""
+    now = data_sync.now_ist()
+    o = db.get(PaperOrder, order_id)
+    if not o or o.status != "pending":
+        raise HTTPException(400, "No pending order with that id.")
+    if not live.market_open(now):
+        raise HTTPException(400, "The market is closed. Enter now works during market hours, 09:15 to 15:30 on trading days.")
+    price = live.state["prices"].get(o.instrument_key)
+    if price is None:
+        price = (await client.ltp([o.instrument_key])).get(o.instrument_key)
+    if price is None:
+        raise HTTPException(400, "No live price is available for this instrument right now.")
+    try:
+        return row(paper.enter_now(db, order_id, float(price), now))
+    except ValueError as exc:
+        _paper_error(exc)
+
+
+@app.get("/api/paper/detail", tags=["paper"])
+def paper_detail(order_id: int | None = None, trade_id: int | None = None, db: Session = Depends(get_db)):
+    """Everything about one paper order or trade, for the chart view on the Paper page: the order, the trade,
+    its zone and the plan it came from."""
+    trade = db.get(PaperTrade, trade_id) if trade_id else None
+    order = db.get(PaperOrder, order_id) if order_id else (db.get(PaperOrder, trade.order_id) if trade and trade.order_id else None)
+    if not order and not trade:
+        raise HTTPException(404, "No paper order or trade with that id.")
+    key = (trade or order).instrument_key
+    names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key == key)).all())
+    z = db.get(Zone, (trade or order).zone_id) if (trade or order).zone_id else None
+    p = db.get(TradePlan, order.plan_id) if order and order.plan_id else None
+    out = {"kind": "option" if trade and trade.kind == "option" else "trade" if trade else "order",
+           "symbol": (trade.label if trade and trade.label else None) or names.get(key) or key.split("|")[-1], "instrument_key": key,
+           "price": live.state["prices"].get(key), "order": row(order) if order else None, "trade": _trade_view(trade, names) if trade else None,
+           "zone": row(z) if z else None, "plan": None}
+    if p:
+        c = p.context or {}
+        out["plan"] = {"mode": p.mode, "entry_type": p.entry_type, "status": p.status, "version": p.version, "score": c.get("score"),
+                       "label": c.get("label"), "curve": c.get("curve"), "itf_trend": c.get("itf_trend"), "htf_trend": c.get("htf_trend"),
+                       "side": c.get("side"), "market_state": c.get("market_state"), "is_default": p.is_default,
+                       "triggered_ts": p.triggered_ts, "plans": p.plans}
+    return out
 
 
 @app.post("/api/paper/positions/{trade_id}/close", tags=["paper"])
@@ -958,30 +1587,77 @@ async def option_chain(symbol: str, expiry: str | None = None, zone_id: int | No
 
 
 # ---------------------------------------------------------------- results (2)
-def _result_row(db: Session, key: str, mode: str, names: dict, fresh: bool = False) -> dict:
-    saved = db.get(ModeResult, (key, mode))
-    data = dict(saved.data) if saved and saved.data and not fresh else results.build(db, key, mode)
+def _result_row(db: Session, key: str, mode: str, names: dict, fresh: bool = False, saved: ModeResult | None = None) -> dict:
+    """One result for a page. Read from the result saved at the last scan; worked out (and saved) here only for one
+    instrument at a time (the chart), never for the whole dashboard."""
+    saved = saved if saved is not None else db.get(ModeResult, (key, mode))
+    if saved and saved.data and not fresh:
+        data = dict(saved.data)
+    else:
+        data = results.build(db, key, mode)
+        results.save(db, key, mode, data)
+        db.commit()
+        saved = db.get(ModeResult, (key, mode))
     price = live.state["prices"].get(key)
     return {**data, "symbol": names.get(key) or key.split("|")[-1], "is_index": "_INDEX|" in key, "live_price": price,
-            "updated_at": saved.updated_at if saved else None}
+            "updated_at": saved.updated_at if saved else None, "signal_since": saved.signal_since if saved else None}
+
+
+_BUILDING: set[tuple[str, str]] = set()      # (instrument, mode) results being built in the background now
+
+
+async def _build_missing(pairs: list[tuple[str, str]]) -> None:
+    """Results the dashboard asked for that were never saved (a mode switched off in Settings, or an older version):
+    built in the scan workers, one after another, and saved. The dashboard shows them as soon as they are there."""
+    try:
+        for key, mode in pairs:
+            try:
+                await scanpool.call(key, scanner.build_result, key, mode)
+            except Exception:
+                log.exception("could not build the %s result of %s", mode, key)
+            finally:
+                _BUILDING.discard((key, mode))
+    finally:
+        for p in pairs:
+            _BUILDING.discard(p)
+
+
+def _results_board(mode: str) -> tuple[dict, list[str]]:
+    """The dashboard, read in one go: the saved results of every ready instrument in one query. Nothing is worked out
+    here. Returns the board and the ready instruments that have no saved result for this mode yet."""
+    with SessionLocal() as db:
+        keys = universe(db)
+        names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all()) if keys else {}
+        state = status.overview(db, keys)
+        ready = [k for k in keys if state[k]["ready"]]
+        saved = {r.instrument_key: r for r in db.scalars(select(ModeResult).where(ModeResult.mode == mode, ModeResult.instrument_key.in_(ready)))} if ready else {}
+        have = [k for k in ready if saved.get(k) is not None and saved[k].data]
+        missing = [k for k in ready if k not in set(have)]
+        board = {"mode": mode, "frames": list(config.MODES[mode]), "total": len(keys), "ready": len(have),
+                 "direction_rule": settings_store.get(db, "direction_rule") or "location",
+                 "approach_pct": settings_store.get(db, "approach_pct"),
+                 "pending": [{"instrument_key": k, "symbol": names.get(k) or k.split("|")[-1], **state[k]} for k in keys if not state[k]["ready"]]
+                 + [{"instrument_key": k, "symbol": names.get(k) or k.split("|")[-1], **state[k], "state": "scanning",
+                     "detail": "the result of this mode is being worked out"} for k in missing],
+                 "busy": [names.get(k) or k.split("|")[-1] for k in have if state[k]["state"] in ("downloading", "scanning")],
+                 "rows": [_result_row(db, k, mode, names, saved=saved[k]) for k in have]}
+        return board, missing
 
 
 @app.get("/api/results", tags=["scan"])
-def results_list(mode: str = "MONTHLY", db: Session = Depends(get_db)):
-    """The dashboard: one full GTF result per ready instrument for the chosen mode, plus the instruments still on their way."""
+async def results_list(mode: str = "MONTHLY"):
+    """The dashboard: the saved GTF result of every ready instrument for the chosen mode, plus the instruments still on
+    their way. Only reads: an instrument whose result for this mode was never saved is listed as on its way and its
+    result is worked out in the background, so the page never waits for a scan."""
     mode = mode.upper()
     if mode not in config.MODES:
         raise HTTPException(400, f"mode must be one of {list(config.MODES)}")
-    keys = universe(db)
-    names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all())
-    state = status.overview(db, keys)
-    ready = [k for k in keys if state[k]["ready"]]
-    return {"mode": mode, "frames": list(config.MODES[mode]), "total": len(keys), "ready": len(ready),
-            "direction_rule": settings_store.get(db, "direction_rule") or "location",
-            "approach_pct": settings_store.get(db, "approach_pct"),
-            "pending": [{"instrument_key": k, "symbol": names.get(k) or k.split("|")[-1], **state[k]} for k in keys if not state[k]["ready"]],
-            "busy": [names.get(k) or k.split("|")[-1] for k in ready if state[k]["state"] in ("downloading", "scanning")],
-            "rows": [_result_row(db, k, mode, names) for k in ready]}
+    board, missing = await asyncio.to_thread(_results_board, mode)
+    new = [(k, mode) for k in missing if (k, mode) not in _BUILDING]
+    if new:
+        _BUILDING.update(new)
+        asyncio.get_running_loop().create_task(_build_missing(new))
+    return board
 
 
 @app.get("/api/result/{symbol:path}", tags=["scan"])
@@ -1010,14 +1686,15 @@ async def scan_check(symbols: list[str] | str = Body("all"), mode: str = Body("M
         raise HTTPException(400, "No ready stock to check. Download and scan some first.")
     names = dict(db.execute(select(Instrument.instrument_key, Instrument.symbol).where(Instrument.instrument_key.in_(keys))).all())
 
-    def work() -> list[dict]:
-        with SessionLocal() as own:        # in a worker thread, so the pages keep answering
-            return [{**scancheck.check(own, k, mode, scan_date, cost_pct), "symbol": names.get(k) or k.split("|")[-1]} for k in keys]
-    rows = await asyncio.to_thread(work)
-    out = {"id": None, "mode": mode, "scan_date": str(scan_date), "rows": rows, "summary": scancheck.summarize(rows)}
+    trail = trailing.options({k: settings_store.get(db, k) for k in trailing.OPTION_KEYS})    # the trailing stop of the Settings page
+
+    # each stock in a worker process on MySQL (several at once), else one after another in a thread: the pages keep answering
+    found = await scanpool.map_heavy(scancheck.check_key, [(k, mode, scan_date, cost_pct, trail) for k in keys])
+    rows = [{**r, "symbol": names.get(k) or k.split("|")[-1]} for k, r in zip(keys, found)]
+    out = {"id": None, "mode": mode, "scan_date": str(scan_date), "rows": rows, "summary": scancheck.summarize(rows), "trail": trail}
     if save:
         run = BacktestRun(status="done", created_at=data_sync.now_ist(), ended_at=data_sync.now_ist(), progress=f"{len(rows)} stocks",
-                          settings={"kind": "scan", "mode": mode, "scan_date": str(scan_date), "symbols": keys, "cost_pct": cost_pct},
+                          settings={"kind": "scan", "mode": mode, "scan_date": str(scan_date), "symbols": keys, "cost_pct": cost_pct, "trail": trail},
                           summary={"summary": out["summary"], "rows": rows})
         db.add(run)
         db.commit()
@@ -1044,7 +1721,8 @@ def scan_check_get(check_id: int, db: Session = Depends(get_db)):
     if not r or not _is_scan(r):
         raise HTTPException(404, "No such saved check")
     return {"id": r.id, "created_at": r.created_at, "mode": r.settings["mode"], "scan_date": r.settings["scan_date"],
-            "cost_pct": r.settings.get("cost_pct"), "rows": (r.summary or {}).get("rows", []), "summary": (r.summary or {}).get("summary", {})}
+            "cost_pct": r.settings.get("cost_pct"), "trail": r.settings.get("trail"),
+            "rows": (r.summary or {}).get("rows", []), "summary": (r.summary or {}).get("summary", {})}
 
 
 @app.delete("/api/scancheck/{check_id}", tags=["backtest"])

@@ -7,6 +7,13 @@ const STATE_CLASS = { TOUCHING_NOW: "in-zone", APPROACHING: "approaching", JUST_
 const WORK_TEXT = { queued: "waiting to start", downloading: "downloading", scanning: "scanning", failed: "failed", ready: "ready" };
 const clock = (s) => (s ? String(s).replace("T", " ").slice(11, 16) : "");
 
+// "10:15" today, "29 Oct 15:20" on an earlier day.
+function sinceText(ts) {
+  const d = new Date(String(ts).replace(" ", "T")), now = new Date();
+  if (isNaN(d)) return String(ts).slice(0, 16);
+  const hm = d.toTimeString().slice(0, 5);
+  return d.toDateString() === now.toDateString() ? hm : `${d.getDate()} ${d.toLocaleString("en", { month: "short" })} ${hm}`;
+}
 function say(text, isError = false) { $("status").textContent = text; $("status").className = "status" + (isError ? " err" : ""); }
 const priceOf = (r) => state.prices[r.instrument_key] ?? r.live_price ?? r.cmp;
 
@@ -28,7 +35,7 @@ const curveDecides = (r) => (r.direction_rule || "location") === "location" && r
 function zoneCell(z, tf) {
   if (!z) return el("td", { class: "muted" }, "None");
   return el("td", { class: "num" }, `${fmtPrice(z.proximal)} to ${fmtPrice(z.distal)}`,
-    el("span", { class: "sub" }, `${TF_LABEL[tf] || ""}, score ${z.score} (${LABEL_TEXT[z.label] || z.label})`));
+    el("span", { class: "sub" }, `${TF_LABEL[tf] || ""}${z.pattern ? " " + z.pattern : ""}, score ${z.score} (${LABEL_TEXT[z.label] || z.label})`));
 }
 
 function shown() {
@@ -124,7 +131,8 @@ function render() {
       zoneCell(r.ltf_zone, r.ltf),
       el("td", {}, r.ltf_zone ? el("span", { class: "tag " + (STATE_CLASS[live.key] || "fresh") }, STATE_TEXT[live.key] || "") : "", el("span", { class: "sub" }, r.ltf_zone ? live.note : "")),
       el("td", {}, el("span", { class: "tag " + (s.signal === "BUY" ? "demand" : s.signal === "SELL" ? "supply" : "") }, s.signal === "BUY" ? "Buy" : s.signal === "SELL" ? "Sell" : "No trade"),
-        el("span", { class: "sub wrap" }, trade ? `${LABEL_TEXT[s.zone_type] || ""}, score ${s.score}` : (s.reason || ""))),
+        el("span", { class: "sub wrap" }, trade ? `${LABEL_TEXT[s.zone_type] || ""}, score ${s.score}` : (s.reason || "")),
+        r.signal_since ? el("span", { class: "sub", title: "When this signal first appeared; it stays while the signal holds" }, `since ${sinceText(r.signal_since)}`) : ""),
       confCell(r),
       el("td", { class: "num" }, !trade ? "" : s.entry != null ? `${fmtPrice(s.entry)}, ${fmtPrice(s.stoploss)}, ${fmtPrice(s.target)}` : `zone at ${fmtPrice(s.watch)}, stop ${fmtPrice(s.stoploss)}`,
         el("span", { class: "sub wrap" }, trade ? entryNote(s) : "")),
@@ -134,10 +142,34 @@ function render() {
         r.ltf_zone ? el("a", { class: "btn", href: `/options?symbol=${encodeURIComponent(r.instrument_key)}&mode=${r.mode}`, onclick: (e) => e.stopPropagation() }, "Options") : "")));
     body.append(tr);
     if (state.open === r.instrument_key) body.append(detailRow(r));
+    if (trade) for (const row of otherRows(r)) body.append(row);
   }
 }
 
-async function paperTrade(r) {
+// The other valid LTF zones of a stock, under its row, at or above the score chosen in "Other LTF zones".
+function otherRows(r) {
+  const { shown, hidden } = otherLtf(r, Number($("f-other").value));
+  const rows = shown.map((z) => el("tr", { class: "other-ltf" },
+    el("td", {}, "\u21b3 other LTF zone", el("span", { class: "sub" }, `${TF_LABEL[z.timeframe] || ""} ${z.pattern}`)),
+    el("td", { class: "num", colspan: "4" }, `${fmtPrice(z.proximal)} to ${fmtPrice(z.distal)}`,
+      el("span", { class: "sub" }, `score ${z.score} (${LABEL_TEXT[z.zone_type] || z.zone_type}), ${testsText(z)}`)),
+    el("td", {}, ENTRY_TEXT[z.primary_entry] || "", el("span", { class: "sub" }, otherStatus(z))),
+    el("td", {}, el("span", { class: "tag " + (STATE_CLASS[z.zone_state] || "fresh") }, STATE_TEXT[z.zone_state] || "")),
+    el("td", { class: "num" }, z.costs_r == null ? "" : `costs ${z.costs_r} R`, el("span", { class: "sub" }, z.stop_pct == null ? "" : `stop ${z.stop_pct}% away`)),
+    el("td", {}),
+    el("td", { class: "num" }, z.entry != null ? `${fmtPrice(z.entry)}, ${fmtPrice(z.stoploss)}, ${fmtPrice(z.target)}` : `zone at ${fmtPrice(z.watch)}, stop ${fmtPrice(z.stoploss)}`,
+      el("span", { class: "sub" }, z.entry != null ? `${z.rr} to 1` : `target from the proximal line: ${fmtPrice(z.target)}`)),
+    el("td", {}, z.can_paper ? el("button", { class: "btn", onclick: () => paperTrade(r, z) }, "Paper trade") : "")));
+  if (hidden > 0) rows.push(el("tr", { class: "other-ltf" }, el("td", { colspan: "11", class: "muted" }, `+${hidden} more LTF ${hidden === 1 ? "zone" : "zones"} below the chosen score`)));
+  return rows;
+}
+
+async function paperTrade(r, zone) {
+  if (zone) {
+    try { const o = await post("/api/paper/orders", { zone_id: zone.zone_id, mode: r.mode }); say(`Paper order placed for ${r.symbol} on the other LTF zone ${fmtPrice(zone.proximal)} to ${fmtPrice(zone.distal)}: ${lower(ENTRY_TEXT[o.entry_type])}, quantity ${o.quantity}. See the Paper page.`); await loadBoard(); }
+    catch (e) { say(`Could not place the paper order. ${e.message}`, true); }
+    return;
+  }
   try { const o = await post("/api/paper/orders", { zone_id: r.ltf_zone.zone_id, mode: r.mode }); say(o.entry_type && o.entry_type !== "TYPE_1" ? `Paper order placed for ${r.symbol}: ${lower(ENTRY_TEXT[o.entry_type])}, ${o.quantity} for now. It fills when ${ENTRY_HOW[o.entry_type]}; the quantity is then worked out again from the real entry. See the Paper page.`
       : `Paper order placed for ${r.symbol}: ${o.quantity} at ${fmtPrice(o.entry)}. See the Paper page.`); await loadBoard(); }
   catch (e) { say(`Could not place the paper order. ${e.message}`, true); }
@@ -206,6 +238,7 @@ function connect() {
   $("f-conf").onchange = () => { try { localStorage.setItem("zoneScanner.confFilter", $("f-conf").value); } catch (e) { /* storage not available */ } render(); };
   buildScoreFilters($("score-filters"), render);
   $("f-search").oninput = render;
+  buildOtherLtf($("f-other"), "zoneScanner.otherLtf", render);
   try { await loadStatus(); await loadBoard(); } catch (e) { say(`Could not load the dashboard. ${e.message}`, true); }
   connect();
   setInterval(() => { loadStatus().catch(() => {}); if (state.board && state.board.pending.length) loadBoard().catch(() => {}); }, 15000);

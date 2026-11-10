@@ -20,7 +20,7 @@ from ..data.resample import close_time
 from ..data.sync import get_state, load_candles, now_ist
 from ..db import SessionLocal
 from ..models import Rejection, TradePlan, Zone, ZoneEvent
-from . import plan
+from . import eye, plan
 from .core import TimeframeEngine
 from .lifecycle import ACTIVE
 
@@ -111,7 +111,7 @@ def scan_timeframe(db: Session, key: str, tf: str, now: datetime | None = None, 
     for ev in events:
         z = ev["zone"]
         zone_id = z.id if z.id is not None else (stored[id(z)].id if id(z) in stored else None)
-        if zone_id is not None:
+        if zone_id is not None and ev["type"] != "touched_again":   # repeated tests: counted on the zone, no row per candle
             db.add(ZoneEvent(zone_id=zone_id, ts=ev["ts"], event_type=ev["type"], price=ev["price"], old_value=ev["old"], new_value=ev["new"]))
     for zone_id, kind, price, when, z in entries:
         plan.record_entry(db, zone_id, kind, price, when, z.distal, th, z.side)
@@ -139,7 +139,23 @@ def scan_key(key: str, force: bool = True, now: datetime | None = None, timefram
         changed = None if force else {s["timeframe"] for s in stats if not s["skipped"]}
         if changed is None or changed:
             result.refresh(db, key, changed, now)
+            eye.store(db, key, now)          # the GTF EYE and Premium rows, so those pages read them in one query
         return stats
+
+
+def build_result(key: str, mode: str) -> None:
+    """Work out and save one mode's result for one instrument (one the dashboard asked for that was never saved).
+    Own session: runs in a scan worker or a thread, never in a page request."""
+    from . import result
+    with SessionLocal() as db:
+        result.save(db, key, mode, result.build(db, key, mode))
+        db.commit()
+
+
+def store_eye(key: str) -> None:
+    """Save the GTF EYE rows of one instrument (for instruments scanned before these rows existed)."""
+    with SessionLocal() as db:
+        eye.store(db, key)
 
 
 def clear_key(db: Session, key: str) -> None:

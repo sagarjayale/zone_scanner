@@ -49,10 +49,10 @@ def test_order_size_fill_stop_and_target():
         assert paper.on_prices(db, {LIVE_KEY: 530.0}, NOW) == []
         assert [e["event"] for e in paper.on_prices(db, {LIVE_KEY: 520.5}, NOW)] == ["filled"]
         trade = db.scalars(select(PaperTrade).where(PaperTrade.zone_id == zid)).one()
-        assert (trade.fill_price, trade.risk, db.get(PaperOrder, order.id).status) == (521.0, 9.0, "filled")
+        assert (trade.fill_price, trade.risk, db.get(PaperOrder, order.id).status) == (520.5, 8.5, "filled")   # the real price
         assert [e["event"] for e in paper.on_prices(db, {LIVE_KEY: 511.0}, NOW)] == ["stopped"]
         db.refresh(trade)
-        assert (trade.exit_price, trade.exit_reason, trade.result, trade.pnl, trade.result_r) == (511.0, "stop", "loss", -11110.0, -1.111)
+        assert (trade.exit_price, trade.exit_reason, trade.result, trade.pnl, trade.result_r) == (511.0, "stop", "loss", -10554.5, -1.118)
     zid = fresh_setup()
     with SessionLocal() as db:
         paper.place(db, zid, NOW)
@@ -185,7 +185,7 @@ def test_paper_options_and_settings_through_the_api(monkeypatch):
         c.portal.call(live.poll_once, fake)
         pos = c.get("/api/paper/positions").json()
         mine = [t for t in pos["open"] if t["zone_id"] == zid]
-        assert len(mine) == 1 and mine[0]["symbol"] == "LIVECO" and mine[0]["open_pnl"] == round((520.0 - 521.0) * 1111, 2)
+        assert len(mine) == 1 and mine[0]["symbol"] == "LIVECO" and mine[0]["open_pnl"] == 0.0     # filled at the real price, 520
         tid = mine[0]["id"]
         assert c.patch(f"/api/paper/positions/{tid}", json={"stop": 600}).status_code == 400            # stop above target
         edited = c.patch(f"/api/paper/positions/{tid}", json={"stop": 515}).json()
@@ -226,7 +226,7 @@ def test_paper_options_and_settings_through_the_api(monkeypatch):
         assert out["sync_job_id"] and wait_job(c, out["sync_job_id"])["status"] == "done"
         assert c.get("/api/jobs").json()[0]["type"] == "new instruments"
         active = lambda d: sorted((z.timeframe, z.side, z.proximal, z.distal, z.touches, z.status) for z in d.scalars(
-            select(Zone).where(Zone.instrument_key == KEY, Zone.status.in_(("fresh", "tested")))))
+            select(Zone).where(Zone.instrument_key == KEY, Zone.status.in_(("fresh", "tested")), Zone.timeframe != "5m")))   # 5 min candles older than 180 days are deleted at each sync, so that timeframe depends on the real date
         with SessionLocal() as db:
             before = active(db)
         c.put("/api/settings", json={"universe": [KEY]})

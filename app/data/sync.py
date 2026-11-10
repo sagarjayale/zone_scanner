@@ -72,6 +72,24 @@ def load_candles(db: Session, key: str, tf: str, since: datetime | None = None,
     return df
 
 
+def count_candles(db: Session, key: str, tf: str) -> int:
+    """Candles stored for one instrument and timeframe (read from the primary key index, quick)."""
+    return int(db.scalar(select(func.count()).select_from(Candle).where(Candle.instrument_key == key, Candle.timeframe == tf)) or 0)
+
+
+def fill_missing_counts(db: Session) -> int:
+    """Once, for sync rows saved before candle counts were kept: count them all in one pass. Runs in the background."""
+    todo = db.scalars(select(SyncState).where(SyncState.candles.is_(None))).all()
+    if not todo:
+        return 0
+    counts = dict(((k, tf), n) for k, tf, n in db.execute(
+        select(Candle.instrument_key, Candle.timeframe, func.count()).group_by(Candle.instrument_key, Candle.timeframe)))
+    for st in todo:
+        st.candles = counts.get((st.instrument_key, st.timeframe), 0)
+    db.commit()
+    return len(todo)
+
+
 def get_state(db: Session, key: str, tf: str) -> SyncState:
     st = db.get(SyncState, (key, tf))
     if st is None:
@@ -99,6 +117,7 @@ def _rebuild_derived(db: Session, key: str, src_tf: str, since: date, now: datet
         st = get_state(db, key, dtf)
         st.last_candle_ts = db.scalar(select(func.max(Candle.ts)).where(Candle.instrument_key == key, Candle.timeframe == dtf))
         st.last_sync_at = now
+        st.candles = count_candles(db, key, dtf)
 
 
 def reset_symbol(db: Session, key: str) -> None:
@@ -128,6 +147,7 @@ def _store(db: Session, key: str, tf: str, cfg: dict, rows: list[dict], first_ti
     st.last_candle_ts = db.scalar(select(func.max(Candle.ts)).where(Candle.instrument_key == key, Candle.timeframe == tf))
     st.last_sync_at = now
     st.gaps = gap_count(db, key, tf, now)
+    st.candles = count_candles(db, key, tf)
     _rebuild_derived(db, key, tf, start, now)
     db.commit()
     return written

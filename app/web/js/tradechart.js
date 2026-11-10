@@ -1,5 +1,5 @@
-// Trade chart on the backtest page: the candles around one trade, with its zone, entry, stop loss and target,
-// and vertical lines where it was entered, where it ended, and where the backtest range ends.
+// Trade chart: the candles around one trade or pending order, with its zone, entry, stop loss and target, and
+// vertical lines where it was entered and where it ended. A pending order has no entry yet; an open trade no exit.
 const TradeChart = (() => {
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const C = { demand: cssVar("--demand"), supply: cssVar("--supply"), brass: cssVar("--brass"), muted: cssVar("--muted"), line: cssVar("--line"), text: cssVar("--text") };
@@ -30,7 +30,7 @@ const TradeChart = (() => {
       if (!this.chart || !t) return;
       target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
         const y = (p) => this.series.priceToCoordinate(p);
-        const xz = this.x(t.formed) ?? 0, xe = this.x(t.entered), xx = this.x(t.exited) ?? mediaSize.width;
+        const xz = this.x(t.formed) ?? 0, xe = t.entered == null ? null : this.x(t.entered), xx = t.exited == null ? mediaSize.width : (this.x(t.exited) ?? mediaSize.width);
         const yp = y(t.proximal), yd = y(t.distal);
         if (yp != null && yd != null) {      // the zone, from the candle that formed it to the exit
           ctx.fillStyle = (t.side === "demand" ? "rgba(47,165,139," : "rgba(208,89,107,") + "0.16)";
@@ -59,7 +59,7 @@ const TradeChart = (() => {
         const level = (price, color, width, dash, label) => {
           const y = this.series.priceToCoordinate(price);
           if (y == null) return;
-          const x1 = this.x(t.entered) ?? 0, x2 = this.x(t.exited) ?? mediaSize.width;
+          const x1 = (t.entered == null ? this.x(t.formed) : this.x(t.entered)) ?? 0, x2 = t.exited == null ? mediaSize.width : (this.x(t.exited) ?? mediaSize.width);
           ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
           ctx.beginPath(); ctx.moveTo(Math.max(x1 - 40, 0), y); ctx.lineTo(Math.min(x2 + 40, mediaSize.width), y); ctx.stroke(); ctx.setLineDash([]);
           ctx.font = `600 12px ${font}`; ctx.textBaseline = "middle";
@@ -69,9 +69,9 @@ const TradeChart = (() => {
         };
         level(t.target, C.demand, 1.5, [6, 4], "Target");
         level(t.stop, C.supply, 3, [], "Stop loss");
-        level(t.entry, C.brass, 3, [], "Entry");
-        vertical(t.entered, C.brass, `Entry ${fmtTime(t.entered)}`, 0, []);
-        vertical(t.exited, t.result === "win" ? C.demand : t.result === "loss" ? C.supply : C.muted, `${t.result === "open" ? "Still open at" : "Exit"} ${fmtTime(t.exited)}`, 1, []);
+        level(t.entry, C.brass, 3, [], t.entered == null ? "Entry (waiting)" : "Entry");
+        if (t.entered != null) vertical(t.entered, C.brass, `Entry ${fmtTime(t.entered)}`, 0, []);
+        if (t.exited != null) vertical(t.exited, t.result === "win" ? C.demand : t.result === "loss" ? C.supply : C.muted, `Exit ${fmtTime(t.exited)}`, 1, []);
         if (t.rangeEnd != null && bars.length && t.rangeEnd >= bars[0].time && t.rangeEnd <= bars[bars.length - 1].time + BAR[t.tf])
           vertical(t.rangeEnd, C.text, `Backtest end ${fmtTime(t.rangeEnd, false)}`, 2, [5, 4]);
       });
@@ -95,22 +95,24 @@ const TradeChart = (() => {
   async function show(box, trade, rangeEnd) {
     if (!chart) init(box);
     const tf = trade.timeframe, bar = BAR[tf] || 86400, intraday = bar < 86400;
-    const formed = toEpoch(trade.zone_created_ts || trade.entry_ts), entered = toEpoch(trade.entry_ts), exited = toEpoch(trade.exit_ts || trade.entry_ts);
+    const entered = trade.entry_ts ? toEpoch(trade.entry_ts) : null, exited = trade.exit_ts ? toEpoch(trade.exit_ts) : null;
+    const formed = trade.zone_created_ts ? toEpoch(trade.zone_created_ts) : (entered ?? Date.now() / 1000);
     const pad = bar * (intraday ? 240 : 45);        // intraday bars only fill a quarter of the day, so the padding is wider
     const iso = (t) => new Date(t * 1000).toISOString().slice(0, 19);
-    const rows = await api(`/api/candles/${encodeURIComponent(trade.instrument_key)}?tf=${tf}&start=${iso(formed - pad)}&end=${iso(exited + pad)}&limit=4000`);
+    const end = exited == null ? "" : `&end=${iso(exited + pad)}`;
+    const rows = await api(`/api/candles/${encodeURIComponent(trade.instrument_key)}?tf=${tf}&start=${iso(formed - pad)}${end}&limit=4000`);
     bars = rows.map((c) => ({ time: toEpoch(c.ts), open: c.open, high: c.high, low: c.low, close: c.close }));
     series.setData(bars);
     for (const l of lines) series.removePriceLine(l);
     const add = (price, color) => series.createPriceLine({ price, title: "", color, lineVisible: false, axisLabelVisible: true });
     lines = [add(trade.entry, C.brass), add(trade.stop, C.supply), add(trade.target, C.demand)];
     const buy = trade.side === "demand";
-    const marks = [{ time: snap(entered), position: buy ? "belowBar" : "aboveBar", shape: buy ? "arrowUp" : "arrowDown", color: C.brass, text: buy ? "Buy" : "Sell" }];
+    const marks = entered == null ? [] : [{ time: snap(entered), position: buy ? "belowBar" : "aboveBar", shape: buy ? "arrowUp" : "arrowDown", color: C.brass, text: buy ? "Buy" : "Sell" }];
     if (trade.exit_ts) marks.push({ time: snap(exited), position: buy ? "aboveBar" : "belowBar", shape: "circle", color: trade.result === "win" ? C.demand : trade.result === "loss" ? C.supply : C.muted, text: trade.result === "win" ? "Target" : trade.result === "loss" ? "Stopped" : "Open" });
     markerLayer.setMarkers(marks.filter((m) => m.time != null).sort((a, b) => a.time - b.time));
     overlay.set({ side: trade.side, tf, proximal: trade.zone_proximal ?? trade.entry, distal: trade.zone_distal ?? trade.stop, entry: trade.entry,
       stop: trade.stop, target: trade.target, formed, entered, exited, result: trade.result, rangeEnd });
-    const i0 = bars.findIndex((b) => b.time >= formed), i1 = bars.findIndex((b) => b.time >= exited);
+    const i0 = bars.findIndex((b) => b.time >= formed), i1 = exited == null ? -1 : bars.findIndex((b) => b.time >= exited);
     const span = Math.max((i1 < 0 ? bars.length : i1) - Math.max(i0, 0), 10);
     chart.timeScale().setVisibleLogicalRange({ from: Math.max(i0, 0) - Math.max(span * 0.6, 20), to: (i1 < 0 ? bars.length : i1) + Math.max(span * 0.6, 20) });
     return bars.length;

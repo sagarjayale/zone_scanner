@@ -1,0 +1,6 @@
+app/main.py
+app/sim/paper.py
+app/web/css/app.css
+app/web/js/paper.js
+tests/test_api.py
+tests/test_z_paper_ladder.py

@@ -81,6 +81,13 @@
         <option value="trend">The ITF trend: up buys, down sells, the curve only blocks the two extremes</option>
       </select></div>
   </div>
+  <div class="form">
+    <div><label class="lbl" for="itf_rule">ITF trend: the slope must pass</label>
+      <select id="itf_rule"><option value="pct">A share of price (scanner.py)</option><option value="atr">A share of the stock's average candle move</option></select></div>
+    <div><label class="lbl" for="itf_slope_pct">Share of price, %</label><input type="number" id="itf_slope_pct" min="0.001" max="5" step="0.01"></div>
+    <div><label class="lbl" for="itf_atr_mult">Average moves</label><input type="number" id="itf_atr_mult" min="0.01" max="5" step="0.01"></div>
+  </div>
+  <p class="hint">The 50 SMA of the ITF must move more than this over 7 candles to count as up or down (wider with fewer candles, as scanner.py does). The average move rule follows how much each stock moves, so a quiet stock and a volatile one are judged alike.</p>
   <div class="actions"><button class="btn primary" id="rule-save">Save and rescan</button></div>
 
   <h2>Trade score and entry type</h2>
@@ -91,7 +98,16 @@
         <option value="TYPE_3">Entry type 3: a candle closes inside the zone and the next closes back out of it (entry at that close)</option>
         <option value="TYPE_2">Entry type 2: a candle closes inside the zone and the next opens inside it (entry at that open)</option>
       </select></div>
+    <div><label class="lbl" for="ltf_min_bases">LTF zone: fewest base candles (0 = off)</label><input type="number" id="ltf_min_bases" min="0" max="20" step="1"></div>
+    <div><label class="lbl" for="ltf_max_bases">LTF zone: most base candles (0 = off)</label><input type="number" id="ltf_max_bases" min="0" max="20" step="1"></div>
   </div>
+  <div class="form">
+    <div><label class="lbl" for="min_stop_pct">LTF zone: smallest stop, % of price (0 = off)</label><input type="number" id="min_stop_pct" min="0" max="20" step="0.05"></div>
+    <label class="check"><input type="checkbox" id="skip_reaction_zones"> Skip zones formed in the reaction of an earlier zone, unless the leg-out is strong (GTF PDF p.35-36)</label>
+    <label class="check"><input type="checkbox" id="check_next_htf"> No trade when a fresh opposite zone one timeframe above the HTF lies between the entry and the target (GTF PDF p.30)</label>
+  </div>
+  <p class="hint">These filters, all off by default, only choose which LTF execution zones are traded. A skipped zone shows its reason on the Dashboard, and the next best zone is used.</p>
+  <p class="hint">The base candle limits only choose which LTF execution zones are traded. Zones are still found, tested and scored the same way, and HTF zones are never filtered. A zone outside the limits is skipped and the next best one is used.</p>
   <div class="actions"><button class="btn primary" id="entry-save">Save and rescan</button></div>
 
   <h2>Calendar</h2>
@@ -103,7 +119,53 @@
   <div class="form">
     <div><label class="lbl" for="paper_capital">Starting capital</label><input type="number" id="paper_capital" min="1000" step="1000"></div>
     <div><label class="lbl" for="paper_risk_pct">Risk per trade, % of capital</label><input type="number" id="paper_risk_pct" min="0.05" max="10" step="0.05"></div>
-    <div><label class="lbl" for="paper_slippage_pct">Slippage on manual close, %</label><input type="number" id="paper_slippage_pct" min="0" max="2" step="0.01"></div>
+    <div><label class="lbl" for="paper_slippage_pct">Slippage on manual close and "Enter now", %</label><input type="number" id="paper_slippage_pct" min="0" max="2" step="0.01"></div>
+  </div>
+
+  <h2>Trailing stop loss</h2>
+  <p class="lede">Moves the stop of a paper position, and of the trades on the Backtest page, as price goes your way. By default: Lock, moved on each live price at once. The stop only moves in your favour, and once it starts it never sits below break-even after charges. A position keeps the trailing settings it was filled with.</p>
+  <div class="form">
+    <div><label class="lbl" for="trail_method">Method</label>
+      <select id="trail_method">
+        <option value="off">Off: the stop stays on the distal line</option>
+        <option value="step">Step: lock 0.5 R for every 0.5 R gained after +1 R</option>
+        <option value="swing">Swing: just beyond each new swing low (long) or high (short)</option>
+        <option value="atr">ATR: a set number of ATRs behind the best price</option>
+        <option value="lock">Lock: steps of the distance to the target</option>
+      </select></div>
+    <div><label class="lbl" for="trail_tf">What moves the stop</label>
+      <select id="trail_tf"><option value="live">Live price: at once, no wait for a candle (5 min candles as backup)</option><option value="ltf">LTF: when the trade's own candle closes</option><option value="itf">ITF: the mode's middle timeframe</option></select></div>
+    <div><label class="lbl" for="trail_start_r">Start trailing after, R</label><input type="number" id="trail_start_r" min="0.25" max="10" step="0.25"></div>
+    <div><label class="lbl" for="trail_atr_mult">ATR method: ATRs behind the best price</label><input type="number" id="trail_atr_mult" min="0.5" max="10" step="0.5"></div>
+    <div><label class="lbl" for="trail_swing">Swing method: candles on each side</label><input type="number" id="trail_swing" min="1" max="5" step="1"></div>
+    <div><label class="lbl" for="trail_lock_pct">Lock method: one step, % of the distance to the target</label><input type="number" id="trail_lock_pct" min="1" max="100" step="1"></div>
+    <div><label class="lbl" for="trail_lock_gap_pct">Lock method: pass a step by this % of a step first</label><input type="number" id="trail_lock_gap_pct" min="0" max="100" step="5"></div>
+    <div><label class="lbl" for="trail_lock_target">Lock method: at the target</label>
+      <select id="trail_lock_target"><option value="move">Move the target one step on and keep going</option><option value="close">Close the trade there</option></select></div>
+    <label class="check"><input type="checkbox" id="trail_lock_behind"> Lock method: keep the stop one step behind the price (step 1 locks break-even, step 2 locks step 1). Off: the stop goes onto the step.</label>
+    <label class="check"><input type="checkbox" id="trail_keep_target"> Keep the fixed target while trailing (off: remove it once trailing starts and let the trade run)</label>
+  </div>
+  <div id="trail-example" class="trail-example"></div>
+  <div class="actions"><button class="btn primary" id="trail-save">Save trailing stop</button>
+    <button class="btn" id="trail-defaults" title="Lock, live price, step 10%, gap 20%, stop on the step, target moves forward">Use the defaults</button></div>
+
+  <div class="form">
+    <label class="check"><input type="checkbox" id="ltf_alerts_all_zones"> Alerts and automatic paper orders on every LTF zone (off: only each mode's default zone)</label>
+  </div>
+
+  <h2>NSE charges</h2>
+  <p class="lede">Used for "costs in R" on the dashboard's other LTF zones. The trade is sized like a paper trade (your capital and risk per trade) and valued at the entry price on both sides. These are starting values: check them against your broker's contract note.</p>
+  <div class="form">
+    <div><label class="lbl" for="nse_product">Product</label><select id="nse_product"><option value="delivery">Delivery</option><option value="intraday">Intraday</option></select></div>
+    <div><label class="lbl" for="brokerage_per_order">Brokerage per order, rupees (0 = none)</label><input type="number" id="brokerage_per_order" min="0" step="1"></div>
+    <div><label class="lbl" for="brokerage_pct">Brokerage, % of order value (the lower of the two is used)</label><input type="number" id="brokerage_pct" min="0" step="0.01"></div>
+    <div><label class="lbl" for="stt_delivery_pct">STT delivery, % on buy and sell</label><input type="number" id="stt_delivery_pct" min="0" step="0.001"></div>
+    <div><label class="lbl" for="stt_intraday_pct">STT intraday, % on sell</label><input type="number" id="stt_intraday_pct" min="0" step="0.001"></div>
+    <div><label class="lbl" for="exchange_txn_pct">Exchange transaction charge, %</label><input type="number" id="exchange_txn_pct" min="0" step="0.00001"></div>
+    <div><label class="lbl" for="sebi_fee_per_crore">SEBI fee, rupees per crore</label><input type="number" id="sebi_fee_per_crore" min="0" step="1"></div>
+    <div><label class="lbl" for="gst_pct">GST, % on brokerage and charges</label><input type="number" id="gst_pct" min="0" step="0.5"></div>
+    <div><label class="lbl" for="stamp_delivery_pct">Stamp duty delivery, % on buy</label><input type="number" id="stamp_delivery_pct" min="0" step="0.001"></div>
+    <div><label class="lbl" for="stamp_intraday_pct">Stamp duty intraday, % on buy</label><input type="number" id="stamp_intraday_pct" min="0" step="0.001"></div>
   </div>
 
   <h2>Options</h2>
@@ -111,7 +173,7 @@
     <div><label class="lbl" for="option_max_spread_pct">Largest bid-ask spread, % of price</label><input type="number" id="option_max_spread_pct" min="0.1" max="20" step="0.1"></div>
     <div><label class="lbl" for="option_min_oi">Smallest open interest</label><input type="number" id="option_min_oi" min="0" step="100"></div>
   </div>
-  <div class="actions"><button class="btn primary" id="misc-save">Save calendar, paper and option settings</button></div>
+  <div class="actions"><button class="btn primary" id="misc-save">Save calendar, paper, charges and option settings</button></div>
 
   <h2>Telegram alerts</h2>
   <p class="lede" id="tg-state"></p>
@@ -130,6 +192,7 @@
   <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Timeframe</th><th>Candle</th><th>Reason</th></tr></thead><tbody id="rejections"></tbody></table></div>
 </main>
 <script src="/static/js/common.js"></script>
+<script src="/static/js/trailexample.js"></script>
 <script src="/static/js/settings.js"></script>
 </body>
 </html>

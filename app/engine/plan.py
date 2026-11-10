@@ -42,7 +42,12 @@ def mode_context(db: Session, key: str, mode: str, cmp: float, as_of=None) -> di
         htf_bars = htf_bars[htf_bars["ts"] >= h_from]
     if i_from is not None and not itf_bars.empty:
         itf_bars = itf_bars[itf_bars["ts"] >= i_from]
-    return gtf.context(zones, htf_bars["close"].to_numpy(dtype=float), itf_bars["close"].to_numpy(dtype=float), cmp, th)
+    ctx = gtf.context(zones, htf_bars["close"].to_numpy(dtype=float), itf_bars["close"].to_numpy(dtype=float), cmp, th)
+    up = gtf.next_htf(mode)
+    if th.get("check_next_htf") and up:        # GTF PDF p.30: the fresh zones one timeframe above the HTF
+        above = db.scalars(select(Zone).where(Zone.instrument_key == key, Zone.timeframe == up, Zone.status.in_(ACTIVE))).all()
+        ctx.update(above=gtf.usable_htf(above, settings_store.thresholds(db, up)), above_tf=up)
+    return ctx
 
 
 def context_summary(ctx: dict, mode: str, th: dict) -> dict:
@@ -85,7 +90,7 @@ def refresh(db: Session, key: str, tf: str, snap: dict, th: dict, now: datetime)
         ctx = mode_context(db, key, mode, snap["cmp"], as_of)
         summary = context_summary(ctx, mode, th)
         keep: set[int] = set()
-        for z, total, label in gtf.candidates(window.keep(active, window.start(mode, tf, as_of, th)), ctx, snap["cmp"], snap["ema"], th):
+        for rank, (z, total, label) in enumerate(gtf.candidates(window.keep(active, window.start(mode, tf, as_of, th)), ctx, snap["cmp"], snap["ema"], th)):
             kind = entry_kind(total, th)
             if kind is None:             # a trade score below 5 is not traded
                 continue
@@ -104,7 +109,8 @@ def refresh(db: Session, key: str, tf: str, snap: dict, th: dict, now: datetime)
             touch = {"ltf": contacts(z, higher, snap["cmp"], th),
                      "htf": contacts(hz, higher, snap["cmp"], th, above_tf=MODES[mode][0]) if hz is not None else []}
             fields = dict(mode=mode, plans=plans, context={**summary, "score": total, "label": label}, zone_state=state,
-                          trend=ctx["itf_trend"], allowed=True, location_pos=None, grade=None, shared=touch, entry_type=kind)
+                          trend=ctx["itf_trend"], allowed=True, location_pos=None, grade=None, shared=touch, entry_type=kind,
+                          is_default=rank == 0)
             status = "triggered" if happened else "pending"
             when = None if not happened else z.t2_ts if kind == "TYPE_2" else close_time(z.t3_ts, tf) if kind == "TYPE_3" else z.updated_ts
             cur = current_plan(db, z.id, mode)

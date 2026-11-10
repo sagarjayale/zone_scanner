@@ -16,6 +16,27 @@ const PLAN_NAME = { type1: "Entry type 1", type2: "Entry type 2", type3: "Entry 
 const PLAN_SHORT = { type1: "Type 1", type2: "Type 2", type3: "Type 3", aggressive: "Aggr.", confirmation: "Conf.", conservative: "Cons." };
 // Which candle gave the distal line. The leg-in or leg-out wick is the course's "exceptional marking".
 const DISTAL_TEXT = { base: "the base candles", "leg-in": "the leg-in wick (exceptional marking)", "leg-out": "the leg-out wick (exceptional marking)" };
+// "Other LTF zones" dropdown on the dashboard and the chart: 0 is Off, otherwise the smallest score shown.
+// Remembered per browser; if storage is not available it behaves as Off.
+const OTHER_LTF_STEPS = [[0, "Other LTF zones: Off"], [5, "Other LTF zones: score 5+"], [6, "Other LTF zones: score 6+"], [7, "Other LTF zones: score 7+"], [8, "Other LTF zones: score 8"]];
+function buildOtherLtf(select, key, changed) {
+  for (const [v, label] of OTHER_LTF_STEPS) select.append(el("option", { value: String(v) }, label));
+  let saved = 0;
+  try { saved = Number(localStorage.getItem(key) || 0); } catch (e) { saved = 0; }
+  select.value = String(OTHER_LTF_STEPS.some(([v]) => v === saved) ? saved : 0);
+  select.onchange = () => { try { localStorage.setItem(key, select.value); } catch (e) { /* storage not available */ } changed(); };
+}
+// The other LTF zones at or above the chosen score, and how many were left out by it.
+function otherLtf(r, min) {
+  const all = (r && r.other_ltf_zones) || [];
+  if (!min) return { shown: [], hidden: 0 };
+  const shown = all.filter((z) => z.score >= min);
+  return { shown, hidden: all.length - shown.length };
+}
+function otherStatus(z) {
+  if (!z.waiting) return "entered";
+  return z.primary_entry === "TYPE_1" ? "waiting for price to reach the zone" : "waits for its candles";
+}
 const testsText = (z) => (z.wick_tests ? `tested ${z.wick_tests === 1 ? "once" : z.wick_tests + " times"}` : "not tested yet") + (z.testing ? ", being tested now" : "");
 const lower = (s) => (s ? String(s).toLowerCase().replace(/_/g, " ") : "unknown");
 
@@ -55,7 +76,7 @@ async function showToken(badge) {
 }
 
 // One navigation for every page.
-const PAGES = [["scanner", "Dashboard"], ["chart", "Chart"], ["paper", "Paper"], ["backtest", "Backtest"], ["options", "Options"], ["data", "Data"], ["settings", "Settings"]];
+const PAGES = [["scanner", "Dashboard"], ["eye", "GTF EYE"], ["premium", "Premium"], ["chart", "Chart"], ["paper", "Paper"], ["option-paper", "Option paper"], ["backtest", "Backtest"], ["options", "Options"], ["data", "Data"], ["settings", "Settings"]];
 (function buildNav() {
   const nav = document.getElementById("nav");
   if (!nav) return;
@@ -64,6 +85,28 @@ const PAGES = [["scanner", "Dashboard"], ["chart", "Chart"], ["paper", "Paper"],
     if (page === nav.dataset.current) a.setAttribute("aria-current", "page");
     nav.append(a);
   }
+})();
+
+// The live price feed, in every page's header: 🟢 prices are fresh, 🔴 they stopped (with how long), ⚪ market closed.
+(function liveBadge() {
+  const nav = document.getElementById("nav");
+  if (!nav || typeof fetch === "undefined") return;
+  const badge = el("span", { class: "badge live-feed", id: "live-feed", title: "The app's live price feed (every 5 seconds in market hours)" }, "…");
+  nav.after(badge);
+  async function check() {
+    if (document.hidden) return;
+    try {
+      const f = await (await fetch("/api/live/feed")).json();
+      if (!f.market_open) { badge.textContent = "⚪ Market closed"; badge.className = "badge live-feed"; return; }
+      if (f.error) { badge.textContent = "🔴 Prices: error"; badge.title = f.error; badge.className = "badge live-feed bad"; return; }
+      const age = f.age_s;
+      badge.textContent = age == null ? "🟡 Waiting for prices" : age <= 15 ? `🟢 Live · ${age} s` : `🔴 No new price for ${age} s`;
+      badge.className = "badge live-feed" + (age != null && age > 15 ? " bad" : "");
+      badge.title = "The app's live price feed (every 5 seconds in market hours)";
+    } catch (e) { badge.textContent = "🔴 App not answering"; badge.className = "badge live-feed bad"; }
+  }
+  check();
+  setInterval(check, 10000);
 })();
 const money = (n) => (n == null ? "" : Number(n).toLocaleString("en-IN", { maximumFractionDigits: 0 }));
 const signed = (n) => (n == null ? "" : `${n > 0 ? "+" : ""}${money(n)}`);

@@ -12,7 +12,7 @@ from .. import settings_store
 from ..config import MODES, TIMEFRAMES
 from ..data.sync import load_candles, now_ist
 from ..models import ModeResult, TradePlan, Zone
-from . import confirm, gtf, plan, window
+from . import confirm, costs, gtf, plan, window
 from .contact import contacts
 from .core import ema_series
 from .lifecycle import ACTIVE
@@ -57,7 +57,7 @@ def build(db: Session, key: str, mode: str, cmp: float | None = None) -> dict:
     out = {"instrument_key": key, "mode": mode, "htf": htf, "itf": itf, "ltf": ltf, "cmp": cmp, "market_state": None, "curve": None,
            "htf_trend": None, "itf_trend": None, "itf_reason": None, "trade_side": "NONE", "demand_zone": None, "supply_zone": None,
            "direction_rule": th.get("direction_rule") or "location", "ltf_zone": None, "ltf_zone_count": 0, "zone_state": None, "contact_ltf": [], "contact_htf": [], "can_paper": False,
-           "confirmation": None,
+           "confirmation": None, "other_ltf_zones": [],
            "signal": {"signal": "NO_TRADE", "primary_entry": None, "entry": None, "stoploss": None, "target": None, "rr": None,
                       "score": 0.0, "zone_type": None, "reason": None, "waiting": False, "watch": None, "type1": None, "type2": None, "type3": None}}
     bars = load_candles(db, key, ltf, last=300)
@@ -80,10 +80,13 @@ def build(db: Session, key: str, mode: str, cmp: float | None = None) -> dict:
         return out
     zones = window.keep(db.scalars(select(Zone).where(Zone.instrument_key == key, Zone.timeframe == ltf, Zone.status.in_(ACTIVE))).all(),
                         window.start(mode, ltf, as_of, th))
-    found = gtf.candidates(zones, ctx, price, ema, th)
+    skipped: list = []
+    found = gtf.candidates(zones, ctx, price, ema, th, skipped)
     out["ltf_zone_count"] = len(found)
+    out["skipped_ltf_zones"] = [{**zone_card(sz, th), "why": why} for sz, why in skipped]
     if not found:
-        out["signal"]["reason"] = "No valid LTF zone between the price and the HTF zone"
+        out["signal"]["reason"] = (f"The LTF zone is not traded: {skipped[0][1]}" if skipped
+                                   else "No valid LTF zone between the price and the HTF zone")
         return out
     z, total, label = found[0]
     times = [t.to_pydatetime() for t in bars["ts"]]
@@ -99,6 +102,7 @@ def build(db: Session, key: str, mode: str, cmp: float | None = None) -> dict:
     out["contact_ltf"] = contacts(z, higher, price, th)
     if ctx["htf_zone"] is not None:
         out["contact_htf"] = contacts(ctx["htf_zone"], higher, price, th, above_tf=htf)
+    out["other_ltf_zones"] = other_zones(db, found[1:], mode, price, times, (low, high, close), th)
     primary = gtf.primary_plan(plans, total, th)
     if primary is None:
         out["signal"]["reason"] = "The trade score is below 5"
@@ -114,18 +118,53 @@ def build(db: Session, key: str, mode: str, cmp: float | None = None) -> dict:
     return out
 
 
+def other_zones(db: Session, rest: list, mode: str, price: float, times: list, last: tuple, th: dict) -> list[dict]:
+    """The other valid LTF zones after the default one, best first: the same candidates the default zone comes from,
+    kept only when their trade score takes an entry type (5 or more). Built during the scan and saved with the result."""
+    rest = [(z, total, label) for z, total, label in rest if entry_kind(total, th)]
+    if not rest:
+        return []
+    capital, risk_pct = float(th.get("paper_capital") or 0), float(th.get("paper_risk_pct") or 0)
+    pending = set(db.scalars(select(TradePlan.zone_id).where(TradePlan.zone_id.in_([z.id for z, _, _ in rest]), TradePlan.mode == mode,
+                                                             TradePlan.is_current.is_(True), TradePlan.status == "pending")).all())
+    low, high, close = last
+    out = []
+    for z, total, label in rest:
+        state = gtf.zone_state(z, len(times) - bisect_right(times, z.created_ts), low, high, close, th)
+        plans = gtf.entry_plans(z, th, touching=state == "TOUCHING_NOW")
+        lead = gtf.primary_plan(plans, total, th)
+        entry = lead["entry"] if lead["entry"] is not None else float(z.proximal)
+        target = lead["target"] if lead["target"] is not None else entry + (1 if z.side == "demand" else -1) * float(th["target_rr"]) * abs(entry - z.distal)
+        card = zone_card(z, th, total, label)
+        out.append({**card, "score": round(total, 2), "zone_type": label, "zone_state": state, "primary_entry": lead["entry_type"],
+                    "entry": lead["entry"], "stoploss": lead["stoploss"], "target": round(float(target), 2), "rr": lead["rr"],
+                    "waiting": not lead["triggered"], "watch": round(float(z.proximal), 2),
+                    "stop_pct": round(abs(entry - float(z.distal)) / price * 100, 2) if price else None,   # entry to stop, % of price
+                    "costs_r": costs.costs_in_r(entry, float(z.distal), z.side, th, capital, risk_pct),
+                    "can_paper": z.id in pending and z.status in ACTIVE})
+    return out
+
+
 def save(db: Session, key: str, mode: str, data: dict, now: datetime | None = None) -> None:
+    """Save a result. signal_since moves only when the signal changes (no trade, buy, sell), so it shows when the current
+    signal first appeared and stays put while the signal holds."""
     row = db.get(ModeResult, (key, mode))
     if row is None:
         row = ModeResult(instrument_key=key, mode=mode)
         db.add(row)
-    row.signal, row.updated_at, row.data = data["signal"]["signal"], now or now_ist(), data
+        db.flush()                     # so a second save in the same session finds it
+    signal = data["signal"]["signal"]
+    if row.signal != signal or row.signal_since is None:
+        row.signal_since = now or now_ist()
+    row.signal, row.updated_at, row.data = signal, now or now_ist(), data
 
 
 def refresh(db: Session, key: str, changed: set[str] | None = None, now: datetime | None = None) -> int:
-    """Rebuild and save the result of every enabled mode. With `changed` (timeframes that got new candles),
-    only the modes that read one of those timeframes are rebuilt."""
-    enabled = settings_store.get(db, "modes") or list(MODES)
+    """Rebuild and save the result of every enabled mode, and of every mode that already has a saved result. With
+    `changed` (timeframes that got new candles), only the modes that read one of those timeframes are rebuilt."""
+    enabled = set(settings_store.get(db, "modes") or list(MODES))
+    # a mode switched off in Settings but already saved (the dashboard asked for it) is kept up to date too
+    enabled |= set(db.scalars(select(ModeResult.mode).where(ModeResult.instrument_key == key)))
     done = 0
     for mode in reversed([m for m in MODES if m in enabled]):     # highest mode first: mode agreement reads the modes above
         if changed is not None and not (set(MODES[mode]) & changed) and db.get(ModeResult, (key, mode)) is not None:

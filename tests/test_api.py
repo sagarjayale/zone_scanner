@@ -18,4 +18,4 @@ def test_api_boots_and_reports_empty_state():
         assert c.get("/api/setups").status_code == 200
         assert c.get("/api/zone/999999").status_code == 404
         assert c.post("/api/data/sync/NSE_INDEX|Nifty 50").status_code == 401   # no token yet
-        assert len([r for r in app.routes if getattr(r, "tags", None)]) == 47   # auth 3, data 7, scan 9, system 7, scan-date checks 4, replay 1, backtest 5, live 2, paper 7, options 2
+        assert len([r for r in app.routes if getattr(r, "tags", None)]) == 65   # paper apply trailing 1, paper auto run 1, auth 3, data 9 (with /api/chart and /api/forming), scan 10 (with /api/eye), system 7, scan-date checks 5 (with export), replay 1, backtest 6 (with delete), live 3, paper 10 (with export), options 2, option paper 7

@@ -22,18 +22,36 @@
   <div class="actions">
     <label class="check"><input type="checkbox" id="auto"> Take every setup automatically at score</label>
     <select id="auto-score" aria-label="Minimum score for automatic orders"><option>5</option><option>6</option><option>7</option><option selected>8</option></select>
+    <label class="check" title="After a scan while the market is closed (Scan all, the 09:00 and 15:40 scans), place automatic orders from the saved scan. They fill from the open, with live prices."><input type="checkbox" id="auto-closed"> Also place automatic orders after a scan when the market is closed</label>
+    <button class="btn" id="auto-run" title="From the last saved scan: no download and no new scan">Place automatic orders now</button>
     <span class="spacer"></span>
     <button class="btn" id="reset">Reset paper account</button>
   </div>
   <p class="status" id="status" role="status"></p>
+  <div class="auto-result" id="auto-result" hidden aria-live="polite"></div>
+  <section class="paper-view" id="view" hidden aria-live="polite">
+    <div class="head"><h2 id="view-title"></h2><span class="spacer"></span><span id="view-actions"></span><button class="btn" id="view-close">Close chart</button></div>
+    <div class="body">
+      <div class="chartbox" id="view-chart"></div>
+      <div id="view-detail"></div>
+    </div>
+  </section>
   <h2>Open positions</h2>
-  <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Side</th><th>Quantity</th><th>Filled</th><th>Stop</th><th>Target</th><th>Price</th><th>Profit or loss</th><th></th></tr></thead><tbody id="open"></tbody></table></div>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Instrument</th><th>Timeframe</th><th>Side</th><th>Quantity</th><th>Entry time</th><th>Entry price</th><th>Open for</th><th>Stop</th><th>Target</th><th>Trailing / locked</th><th>Price</th><th>Profit or loss</th><th></th></tr></thead><tbody id="open"></tbody></table></div>
   <h2>Pending orders</h2>
-  <div class="table-wrap"><table class="board"><thead><tr><th>Instrument</th><th>Timeframe</th><th>Side</th><th>Quantity</th><th>Entry type</th><th>Entry</th><th>Stop</th><th>Target</th><th>Price</th><th></th></tr></thead><tbody id="pending"></tbody></table></div>
-  <h2>Closed trades</h2>
-  <div class="table-wrap"><table><thead><tr><th>Instrument</th><th>Side</th><th>Quantity</th><th>Filled</th><th>Exited</th><th>Entry</th><th>Exit</th><th>Why</th><th>Profit or loss</th><th>Result</th></tr></thead><tbody id="closed"></tbody></table></div>
+  <div class="near-chips" id="near-chips" role="group" aria-label="Show pending orders by how near the entry is"></div>
+  <p class="hint near-help">How far the price still has to travel to the entry, in R (1 R = entry to stop): 🔴 entering now under 0.25 R,
+    🟢 close up to 1 R, 🟡 between 1 and 3 R, ⚪ far beyond 3 R. The arrow and the time come from the live prices of the last
+    5 minutes and are only a rough guess at the current speed. Entry type 1 fills the moment the price touches the entry
+    (a gap past it at the open fills at the open); entry types 2 and 3 wait for their candles to close.</p>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Instrument</th><th>Distance to entry</th><th>Timeframe</th><th>Side</th><th>Quantity</th><th>Entry type</th><th>Entry</th><th>Stop</th><th>Target</th><th>Price</th><th>Placed at</th><th>Signal time</th><th></th></tr></thead><tbody id="pending"></tbody></table></div>
+  <div class="head"><h2>Closed trades</h2><span class="spacer"></span><a class="btn" id="export" href="/api/paper/export" download>Download CSV</a></div>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Instrument</th><th>Timeframe</th><th>Side</th><th>Quantity</th><th>Entry time</th><th>Exit time</th><th>Duration</th><th>Entry</th><th>Exit</th><th>Why</th><th>Charges</th><th>Profit or loss</th><th>Result</th><th></th></tr></thead><tbody id="closed"></tbody></table></div>
 </main>
+<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
 <script src="/static/js/common.js"></script>
+<script src="/static/js/tradechart.js"></script>
+<script src="/static/js/paperview.js"></script>
 <script src="/static/js/paper.js"></script>
 </body>
 </html>

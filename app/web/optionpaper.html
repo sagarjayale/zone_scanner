@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option paper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Zone scanner</span>
+  <nav class="nav" id="nav" aria-label="Pages" data-current="option-paper"></nav>
+  <span class="spacer"></span>
+  <span class="badge" id="token">Checking login</span>
+</header>
+<main class="page">
+  <h1>Option paper trading</h1>
+  <p class="lede">The scanner's signals traded with options, in their own paper account. A BUY signal buys a call (CE), a SELL
+    signal buys a put (PE); options are never sold here. The order waits for the <strong>stock</strong> to reach the entry;
+    the stop, the target and the trailing stop follow the stock's price, and the option is sold at its live price. On the
+    expiry day the position is closed at the time set below. Paper only: no order is ever sent to your broker.</p>
+  <dl class="figures" id="figures"></dl>
+  <p class="feed" id="feed" aria-live="polite"></p>
+
+  <details class="opt-settings" id="opt-settings">
+    <summary>Option paper settings</summary>
+    <div class="grid">
+      <label class="lbl" for="opt_paper_capital">Capital (₹)</label><input id="opt_paper_capital" type="number" min="10000" step="10000">
+      <label class="lbl" for="opt_paper_risk_pct">Risk per trade, % of the balance</label><input id="opt_paper_risk_pct" type="number" min="0.1" max="10" step="0.1">
+      <label class="lbl" for="opt_strike_rule">Strike</label>
+      <select id="opt_strike_rule"><option value="delta">Delta nearest 0.55 (moves almost with the stock)</option><option value="atm">At the money</option>
+        <option value="otm1">One strike out of the money</option><option value="target">Strike nearest the target (cheap, decays faster)</option></select>
+      <label class="lbl" for="opt_min_days">Minimum days to expiry</label><input id="opt_min_days" type="number" min="0" max="60" step="1">
+      <label class="lbl" for="opt_max_premium_pct">Max premium per trade, % of the balance</label><input id="opt_max_premium_pct" type="number" min="1" max="100" step="1">
+      <label class="lbl" for="opt_expiry_close">Close on the expiry day at (IST)</label><input id="opt_expiry_close" type="text" placeholder="15:15">
+      <label class="lbl" for="opt_premium_stop_pct">Extra stop on the premium, % below the fill (0 = off)</label><input id="opt_premium_stop_pct" type="number" min="0" max="95" step="5">
+      <label class="lbl" for="opt_auto_min_score">Automatic orders at score</label><input id="opt_auto_min_score" type="number" min="0" max="10" step="0.5">
+    </div>
+    <label class="check"><input type="checkbox" id="opt_auto"> Place option orders automatically for every signal at that score (in market hours)</label>
+    <label class="check"><input type="checkbox" id="opt_auto_closed"> Also after a scan while the market is closed (chosen from the last option chain prices; they buy from the open)</label>
+    <p class="hint">Trailing uses the Lock or Step settings of the Settings page, on the stock's price, at once on each live price.
+      Charges use the brokerage, SEBI, GST and stamp duty of the Settings page, with STT of 0.1% on the sell premium.</p>
+    <div class="actions"><button class="btn primary" id="opt-save">Save option settings</button></div>
+  </details>
+
+  <div class="actions">
+    <button class="btn" id="auto-run" title="Option orders for every signal at or above the automatic score, from the last saved scan">Place automatic option orders now</button>
+    <span class="spacer"></span>
+    <button class="btn" id="reset">Reset option paper account</button>
+  </div>
+  <p class="status" id="status" role="status"></p>
+  <div class="auto-result" id="auto-result" hidden aria-live="polite"></div>
+
+  <h2>Open positions</h2>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Option</th><th>Strike</th><th>Bought at</th><th>Premium now</th>
+    <th>Stop (premium, est.)</th><th>Target (premium, est.)</th><th>Profit or loss</th><th>Stock now / stop / target</th><th>Trailing / locked</th>
+    <th>Open for</th><th></th></tr></thead><tbody id="open"></tbody></table></div>
+
+  <h2>Pending orders</h2>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Option</th><th>Strike</th><th>Expiry</th><th>Premium now</th>
+    <th>Buy at (est.)</th><th>Stop (est.)</th><th>Target (est.)</th><th>Lots · cost</th><th>Risk (1 R)</th><th>Stock now → entry</th>
+    <th>Placed</th><th></th></tr></thead><tbody id="pending"></tbody></table></div>
+
+  <h2>Signals you can trade</h2>
+  <p class="hint">The scanner's current plans on stocks that have options (others are not shown). For each one the option it would get now is shown (from the option chain,
+    refreshed every 15 minutes); Place option order chooses it again from the live chain.</p>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Stock</th><th>Signal</th><th>Score</th><th>Entry / stop / target (stock)</th>
+    <th>Option</th><th>Strike</th><th>Premium now</th><th>Est. buy at</th><th>Lots · cost</th><th></th></tr></thead><tbody id="signals"></tbody></table></div>
+
+  <div class="head"><h2>Closed trades</h2><span class="spacer"></span><a class="btn" id="export" href="/api/option-paper/export" download>Download CSV</a></div>
+  <div class="table-wrap"><table class="board"><thead><tr><th>Option</th><th>Strike</th><th>Premium in → out</th><th>Change</th><th>Stock in → out</th><th>Why</th>
+    <th>Entry time</th><th>Duration</th><th>Lots</th><th>Charges</th><th>Profit or loss after charges</th><th>Result</th></tr></thead><tbody id="closed"></tbody></table></div>
+</main>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/paperview.js"></script>
+<script src="/static/js/optionpaper.js"></script>
+</body>
+</html>

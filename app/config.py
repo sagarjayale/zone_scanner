@@ -57,8 +57,16 @@ DEFAULTS = {
     "leg_body_pct": 50.0,        # explosive candle: body strictly above this share of the range
     "max_base": 6,
     "marking_rule": "scanner",   # scanner: zones found, tested and scored as scanner.py v6.4 does; pdf: as the GTF course PDF marks them
-    "zone_history": "scanner",
-    "htf_zone_pick": "fresh",    # fresh: the nearest HTF demand and supply must never have been tested (GTF PDF page 31); any: any live zone (scanner.py)   # scanner: only zones inside scanner.py's history window for each mode and timeframe; all: every stored zone
+    "zone_history": "scanner",   # scanner: only zones inside scanner.py's history window for each mode and timeframe; all: every stored zone
+    "htf_zone_pick": "fresh",    # fresh: the nearest HTF demand and supply must never have been tested (GTF PDF page 31); any: any live zone (scanner.py)
+    "ltf_min_bases": 0,          # an LTF execution zone with fewer base candles than this is not traded (0 = off)
+    "ltf_max_bases": 0,          # an LTF execution zone with more base candles than this is not traded (0 = off)
+    "min_stop_pct": 0.0,         # an LTF execution zone whose stop is closer than this % of price is not traded (0 = off): charges eat thin zones
+    "skip_reaction_zones": False,  # GTF PDF p.35-36: a zone formed in the reaction of an earlier zone is not traded, unless its leg-out is strong
+    "check_next_htf": False,     # GTF PDF p.30: no trade when a fresh opposite zone one timeframe above the HTF lies between the entry and the target
+    "itf_rule": "pct",           # ITF trend threshold. pct: a share of price (scanner.py); atr: a share of the average move per candle
+    "itf_slope_pct": 0.05,       # pct rule: the 50 SMA must move more than this % of price over 7 candles
+    "itf_atr_mult": 0.1,         # atr rule: the 50 SMA must move more than this many average moves (last 14 candles) over 7 candles
     "gap_exciting_pct": 0.25,    # a candle that opens at least this far (% of price) beyond the previous high or low counts as exciting
     "max_wick_tests": 1,         # earlier tests an execution zone may have; one more test uses the zone up
     "min_score": 5.0,            # 7 = entry type 1 only, 5 = entry types 2 and 3 as well
@@ -77,9 +85,44 @@ DEFAULTS = {
     "modes": list(MODES),        # analysis modes the scanner runs
     "fiscal_year": False,
     "universe": ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"],
+    "ltf_alerts_all_zones": False,   # alerts and automatic paper orders on every LTF zone, not only each mode's default (best) zone
+    # NSE equity charges, used for "costs in R". Starting values only: check them against your broker's contract note.
+    "nse_product": "delivery",       # delivery | intraday
+    "brokerage_per_order": 20.0,     # rupees per executed order (0 for a zero-brokerage delivery account) ...
+    "brokerage_pct": 0.03,           # ... or this % of the order value, whichever is lower
+    "stt_delivery_pct": 0.1,         # STT on delivery: buy and sell
+    "stt_intraday_pct": 0.025,       # STT on intraday: sell side only
+    "exchange_txn_pct": 0.00297,     # NSE transaction charge, both sides
+    "sebi_fee_per_crore": 10.0,      # SEBI turnover fee, both sides
+    "gst_pct": 18.0,                 # GST on brokerage, exchange and SEBI charges
+    "stamp_delivery_pct": 0.015,     # stamp duty on the buy side, delivery
+    "stamp_intraday_pct": 0.003,     # stamp duty on the buy side, intraday
     # paper trading
     "paper_capital": 1000000.0, "paper_risk_pct": 1.0, "paper_slippage_pct": 0.05,
     "paper_auto": False, "paper_auto_min_score": 8,
+    "paper_auto_closed": False,      # also place automatic orders after a scan while the market is closed (from the saved scan)
+    # option paper trading (its own account): buy a call on a BUY signal, a put on a SELL signal, managed on the stock's price
+    "opt_paper_capital": 500000.0, "opt_paper_risk_pct": 1.0,
+    "opt_strike_rule": "delta",      # delta (nearest 0.55) | atm | otm1 (one strike out of the money) | target (strike nearest the target)
+    "opt_min_days": 7,               # nearest expiry with at least this many days left, else the next one
+    "opt_max_premium_pct": 20.0,     # one trade's premium at most this % of the option account balance
+    "opt_auto": False, "opt_auto_min_score": 8,
+    "opt_auto_closed": False,        # automatic option orders also after a scan while the market is closed (last chain prices)
+    "opt_expiry_close": "15:15",     # positions are closed at this time on their expiry day
+    "opt_premium_stop_pct": 0.0,     # extra stop on the premium: close when it falls this % below the fill (0 = off)
+    "opt_stt_pct": 0.1,              # STT on options: sell side, on the premium
+    "opt_exchange_pct": 0.03503,     # exchange transaction charge on options premium, both sides
+    # trailing stop loss (sim/trailing.py), for paper trading and the scan-date check. Lock on live prices by default; off: every trade keeps its first stop.
+    "trail_method": "lock",      # off | step | swing | atr | lock
+    "trail_start_r": 1.0,        # trailing starts once price has gone this many R in the trade's favour
+    "trail_keep_target": True,   # keep the fixed target while trailing (false: remove it once trailing starts and let the trade run)
+    "trail_atr_mult": 2.0,       # atr: the stop stays this many ATRs behind the best price
+    "trail_swing": 2,            # swing: candles on each side of a swing low (or high)
+    "trail_tf": "live",          # what moves the stop: live (each live price, at once), ltf (the trade's own candles) or itf (the mode's middle timeframe)
+    "trail_lock_pct": 10.0,      # lock: one step is this % of the distance from the entry to the first target
+    "trail_lock_gap_pct": 20.0,  # lock: price must pass a step by this % of one step before the stop moves to it
+    "trail_lock_behind": False,  # lock: keep the stop one step behind (step 1 locks break-even) instead of on the step
+    "trail_lock_target": "move", # lock: at the target, "move" it forward one step (the trade runs) or "close" there
     # options
     "option_max_spread_pct": 2.0, "option_min_oi": 1000,
     # alerts

@@ -2,7 +2,11 @@
 and what then happened to the entry its trade score takes, in the candles after it. No Upstox call is made.
 
 A trade score of 7 or more takes entry type 1; a score of 5 to 6.5 takes entry types 2 and 3 (both are followed).
-The entry has to come on the zone's next test: once that test is over the zone is no longer what was scored."""
+The entry has to come on the zone's next test: once that test is over the zone is no longer what was scored.
+
+Trailing stop (Settings, off by default): the stop of an entered trade moves as sim/trailing.py says, on the closed
+LTF or ITF candles after the fill, exactly as in paper trading. A trade that ends on a stop that has moved is
+"trailed out"; it counts as a win when its result after costs is above 0 R."""
 from datetime import date, datetime, time
 
 import numpy as np
@@ -18,27 +22,84 @@ from ..engine.core import TimeframeEngine
 from ..engine.result import no_side_reason, zone_card
 from ..engine import window
 from ..engine.score import ema_point
-from . import fills
+from . import fills, trailing
 
 PLANS = ("type1", "type2", "type3")
-ENTERED = ("target hit", "stopped", "open")
+ENTERED = ("target hit", "stopped", "trailed out", "open")
 
 
-def _walk(eng: TimeframeEngine, start: int, side: str, entry: float, stop: float, target: float, cost_pct: float) -> dict:
-    """Follow an open position from candle `start` to its exit, with the fill rules the backtest uses."""
+def is_win(o: dict) -> bool:
+    return o["status"] == "target hit" or (o["status"] == "trailed out" and (o.get("result_r") or 0) > 0)
+
+
+class TrailFeed:
+    """Feeds a trade's trailing stop with the closed candles of the trailing timeframe (the LTF engine's own candles,
+    or the ITF candles that have closed by the end of each LTF candle)."""
+
+    def __init__(self, opts: dict, eng: TimeframeEngine, ltf: str, itf: str, i_df, cost_pct: float):
+        self.opts, self.eng, self.ltf, self.itf = opts, eng, ltf, itf
+        self.use_itf = opts["trail_tf"] == "itf" and i_df is not None and not i_df.empty
+        self.cost_frac = 2 * float(cost_pct or 0) / 100.0
+        if self.use_itf:
+            self.i_ts = [t.to_pydatetime() for t in i_df["ts"]]
+            self.i_close = [close_time(t, itf) for t in self.i_ts]
+            self.i_bars = list(zip(i_df["high"].astype(float), i_df["low"].astype(float), i_df["close"].astype(float)))
+
+    def make(self, side: str, entry: float, stop: float, target: float, fill_i: int) -> trailing.Trailer:
+        fill_ts = self.eng.ts[fill_i]
+        if self.use_itf:
+            before = [b for t, ct, b in zip(self.i_ts, self.i_close, self.i_bars) if ct <= fill_ts][-20:]
+        else:
+            before = [(self.eng.h[k], self.eng.l[k], self.eng.c[k]) for k in range(max(0, fill_i - 20), fill_i)]
+        tr = trailing.Trailer(side, entry, stop, self.opts, before, target, self.cost_frac)
+        tr.next_k = 0
+        if self.use_itf:      # the first ITF candle that opened at or after the fill
+            while tr.next_k < len(self.i_ts) and self.i_ts[tr.next_k] < fill_ts:
+                tr.next_k += 1
+        return tr
+
+    def feed(self, tr: trailing.Trailer, i: int) -> None:
+        """LTF candle i has closed: move the stop."""
+        if not self.use_itf:
+            tr.close_bar(self.eng.h[i], self.eng.l[i], self.eng.c[i])
+            return
+        end = close_time(self.eng.ts[i], self.ltf)
+        while tr.next_k < len(self.i_ts) and self.i_close[tr.next_k] <= end:
+            tr.close_bar(*self.i_bars[tr.next_k])
+            tr.next_k += 1
+
+
+def _walk(eng: TimeframeEngine, start: int, side: str, entry: float, stop: float, target: float, cost_pct: float,
+          feed: TrailFeed | None = None, fill_i: int | None = None) -> dict:
+    """Follow an open position from candle `start` to its exit, with the fill rules the backtest uses.
+    With a trailing stop, each candle is checked against the stop as it stood, then the stop moves at its close."""
     risk = abs(entry - stop)
+    tr = feed.make(side, entry, stop, target, start if fill_i is None else fill_i) if feed else None
     for i in range(start, len(eng)):
-        hit = fills.exit_after_entry(side, stop, target, eng.o[i], eng.h[i], eng.l[i])
+        cur_stop, cur_target = (tr.stop, tr.live_target()) if tr else (stop, target)
+        hit = fills.exit_after_entry(side, cur_stop, cur_target, eng.o[i], eng.h[i], eng.l[i])
         if hit:
-            return {"status": "target hit" if hit[1] == "win" else "stopped", "exit_price": float(hit[0]), "exit_ts": eng.ts[i].isoformat(),
-                    "result_r": round(fills.result_r(side, entry, hit[0], risk, cost_pct), 2)}
-    return {"status": "open", "exit_price": float(eng.c[-1]), "exit_ts": eng.ts[-1].isoformat(),
-            "result_r": round(fills.result_r(side, entry, float(eng.c[-1]), risk, cost_pct), 2)}
+            moved = tr is not None and tr.moves > 0
+            out = {"status": "target hit" if hit[1] == "win" else "trailed out" if moved else "stopped",
+                   "exit_price": float(hit[0]), "exit_ts": eng.ts[i].isoformat(),
+                   "result_r": round(fills.result_r(side, entry, hit[0], risk, cost_pct), 2)}
+            if tr:
+                out.update(stop_moves=tr.moves, final_stop=round(tr.stop, 2), best_r=round(tr.best_r, 2), trail_note=tr.why)
+            return out
+        if tr:
+            feed.feed(tr, i)
+    out = {"status": "open", "exit_price": float(eng.c[-1]), "exit_ts": eng.ts[-1].isoformat(),
+           "result_r": round(fills.result_r(side, entry, float(eng.c[-1]), risk, cost_pct), 2)}
+    if tr:
+        out.update(stop_moves=tr.moves, final_stop=round(tr.stop, 2), best_r=round(tr.best_r, 2), trail_note=tr.why)
+    return out
 
 
-def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0.05) -> dict:
+def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0.05, trail: dict | None = None) -> dict:
+    """trail: the trailing stop options (sim/trailing.py); None reads them from the settings."""
     htf, itf, ltf = MODES[mode]
     th = settings_store.thresholds(db, ltf)
+    trail = trailing.options(trail if trail is not None else {k: settings_store.get(db, k) for k in trailing.OPTION_KEYS})
     out = {"instrument_key": key, "mode": mode, "htf": htf, "itf": itf, "ltf": ltf, "scan_date": str(scan_date), "scan_ts": None, "cmp": None,
            "market_state": None, "curve": None, "htf_trend": None, "itf_trend": None, "itf_reason": None, "trade_side": "NONE",
            "demand_zone": None, "supply_zone": None, "ltf_zone": None, "zone_state": None, "contact_ltf": [], "contact_htf": [],
@@ -72,6 +133,17 @@ def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0
     h_closes = [c for t, c in zip(h_eng.ts[:hi], h_eng.c[:hi]) if h_from is None or t >= h_from]
     price = float(eng.c[cut])
     ctx = gtf.context(window.keep(h_eng.active, h_from), np.array(h_closes, dtype=float), i_closes, price, th)
+    up = gtf.next_htf(mode)
+    if th.get("check_next_htf") and up:          # GTF PDF p.30: the fresh zones one timeframe above, as of the scan date
+        u_df = load_candles(db, key, up)
+        if not u_df.empty:
+            th_up = settings_store.thresholds(db, up)
+            u_eng = TimeframeEngine(u_df, up, th_up)
+            ui = 0
+            while ui < len(u_eng) and close_time(u_eng.ts[ui], up) <= t_close:
+                u_eng.step(ui)
+                ui += 1
+            ctx.update(above=gtf.usable_htf(u_eng.active, th_up), above_tf=up)
     th_htf = settings_store.thresholds(db, htf)
     out.update(scan_ts=eng.ts[cut].isoformat(), cmp=price, last_ts=eng.ts[-1].isoformat(), market_state=ctx["market_state"], curve=ctx["curve"],
                htf_trend=ctx["htf_trend"], itf_trend=ctx["itf_trend"], itf_reason=ctx["itf_reason"], trade_side=ctx["side"],
@@ -80,9 +152,11 @@ def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0
         out["signal"]["reason"] = no_side_reason(ctx)
         return out
     emas = eng.emas(cut)
-    found = gtf.candidates(window.keep(eng.active, l_from), ctx, price, emas, th)
+    skipped: list = []
+    found = gtf.candidates(window.keep(eng.active, l_from), ctx, price, emas, th, skipped)
     if not found:
-        out["signal"]["reason"] = "No valid LTF zone between the price and the HTF zone"
+        out["signal"]["reason"] = (f"The LTF zone is not traded: {skipped[0][1]}" if skipped
+                                   else "No valid LTF zone between the price and the HTF zone")
         return out
     z, total, label = found[0]
     made_at = eng.ts.index(z.created_ts)
@@ -107,11 +181,13 @@ def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0
     by_score = "type 1" if total >= 7 else "types 2 and 3"
     testing_on_scan = bool(z.in_visit)
 
+    feed = TrailFeed(trail, eng, ltf, itf, i_df, cost_pct) if trailing.is_on(trail) else None
+
     def taken(entry: float, i: int, start: int) -> dict:
         """An entry at candle i; the exit is looked for from candle `start` on."""
         target = entry + sign * rr * abs(entry - stop)
         return {"entry": float(entry), "entry_ts": eng.ts[i].isoformat(), "stop": stop, "target": float(target),
-                **_walk(eng, start, side, float(entry), stop, float(target), cost_pct)}
+                **_walk(eng, start, side, float(entry), stop, float(target), cost_pct, feed, i)}
 
     if total >= 7:
         for p in ("type2", "type3"):
@@ -165,13 +241,20 @@ def check(db: Session, key: str, mode: str, scan_date: date, cost_pct: float = 0
     return out
 
 
+def check_key(key: str, mode: str, scan_date: date, cost_pct: float = 0.05, trail: dict | None = None) -> dict:
+    """check() with its own database session, so it can run in a worker process (jobs/scanpool.py)."""
+    from ..db import SessionLocal
+    with SessionLocal() as db:
+        return check(db, key, mode, scan_date, cost_pct, trail)
+
+
 def summarize(rows: list[dict]) -> dict:
     out = {}
     for p in PLANS:
         got = [r["outcomes"][p] for r in rows]
         entered = [o for o in got if o["status"] in ENTERED]
         closed = [o for o in entered if o["status"] != "open"]
-        wins = [o for o in closed if o["status"] == "target hit"]
+        wins = [o for o in closed if is_win(o)]
         out[p] = {"entered": len(entered), "target_hit": len(wins), "stopped": len(closed) - len(wins),
                   "open": len(entered) - len(closed), "never_entered": sum(1 for o in got if o["status"] == "never entered"),
                   "not_taken": sum(1 for o in got if o["status"] == "not taken"),

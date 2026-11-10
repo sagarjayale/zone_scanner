@@ -13,7 +13,7 @@ from .data.sync import now_ist
 from .db import SessionLocal
 from .alerts import telegram
 from .models import Instrument, TradePlan, Zone, ZoneEvent
-from .sim import paper
+from .sim import optionpaper, paper
 from .upstox.client import UpstoxError
 
 POLL_SECONDS = 5
@@ -21,16 +21,27 @@ STALE_AFTER = 30   # seconds without a successful poll before prices are shown a
 
 
 class Hub:
-    """Pages connected to /ws/live."""
+    """Pages connected to /ws/live. A message goes to every page at the same time, with a time limit each: a page
+    that does not take it within SEND_TIMEOUT seconds (a sleeping laptop, a frozen tab) is dropped and reconnects by
+    itself, so it never holds up the other pages or the next price round."""
+    SEND_TIMEOUT = 2.0
+
     def __init__(self):
         self.clients: set[WebSocket] = set()
 
-    async def broadcast(self, message: dict) -> None:
-        for ws in list(self.clients):
+    async def _send(self, ws: WebSocket, message: dict) -> None:
+        try:
+            await asyncio.wait_for(ws.send_json(message), self.SEND_TIMEOUT)
+        except Exception:
+            self.clients.discard(ws)
             try:
-                await ws.send_json(message)
+                await asyncio.wait_for(ws.close(), 1)
             except Exception:
-                self.clients.discard(ws)
+                pass
+
+    async def broadcast(self, message: dict) -> None:
+        if self.clients:
+            await asyncio.gather(*(self._send(ws, message) for ws in list(self.clients)))
 
 
 hub = Hub()
@@ -54,11 +65,16 @@ def next_bar_close(now: datetime) -> datetime | None:
 
 
 def watch_rows(db: Session) -> list:
-    """Fresh zones with a pending plan in some mode (the HTF curve and ITF trend allow the trade) at or above the minimum score."""
+    """Fresh zones with a pending plan in some mode (the HTF curve and ITF trend allow the trade) at or above the minimum score.
+    Only each mode's default (best) LTF zone, unless "Alerts and automatic paper orders on every LTF zone" is on.
+    Plans made before that marking existed (is_default not set yet) count as default until the next scan marks them."""
     floor = settings_store.get(db, "min_score")
-    return db.execute(select(Zone, TradePlan).join(TradePlan, TradePlan.zone_id == Zone.id).where(
+    q = select(Zone, TradePlan).join(TradePlan, TradePlan.zone_id == Zone.id).where(
         Zone.status == "fresh", TradePlan.is_current.is_(True), TradePlan.status == "pending",
-        TradePlan.allowed.is_(True), Zone.score >= floor)).all()
+        TradePlan.allowed.is_(True), Zone.score >= floor)
+    if not settings_store.get(db, "ltf_alerts_all_zones"):
+        q = q.where(TradePlan.is_default.isnot(False))
+    return db.execute(q).all()
 
 
 def check_prices(db: Session, prices: dict[str, float], now: datetime) -> list[dict]:
@@ -102,23 +118,39 @@ def check_prices(db: Session, prices: dict[str, float], now: datetime) -> list[d
     return alerts
 
 
-async def poll_once(client, now: datetime | None = None) -> list[dict]:
-    """One price poll: the stock list, every watched instrument, and anything held on paper.
-    Raises alerts, applies paper fills, and pushes all of it to the pages and to Telegram."""
-    now = now or now_ist()
+def _round_keys(now: datetime) -> list[str]:
+    """What the price round fetches: the stock list, every watched instrument, anything held on paper, and the
+    options of option paper (and those shown for its signals)."""
     with SessionLocal() as db:
         rows = watch_rows(db)
-        held = {o.instrument_key for o in paper.live_orders(db)} | {t.instrument_key for t in paper.open_trades(db)}
-        keys = sorted(set(settings_store.get(db, "universe") or []) | {z.instrument_key for z, _ in rows} | held)
-        if not keys:
-            return []
-        prices = await client.ltp(keys)
-        state["prices"].update(prices)
-        state["last_poll"], state["error"] = now, None
+        held = {o.instrument_key for o in paper.live_orders(db)} | {t.instrument_key for t in paper.open_trades(db)} | optionpaper.watch_keys(db, now)
+        return sorted(set(settings_store.get(db, "universe") or []) | {z.instrument_key for z, _ in rows} | held)
+
+
+def _round_apply(prices: dict, now: datetime) -> tuple:
+    """The database work of one price round: automatic paper orders, paper fills and exits, option paper, alerts."""
+    with SessionLocal() as db:
+        rows = watch_rows(db)
         placed = paper.auto_orders(db, rows, now)        # before the alert check, while the plans are still pending
         fills_ = paper.on_prices(db, prices, now)
+        opt_events = optionpaper.on_prices(db, prices, now)
         alerts = check_prices(db, prices, now)
+        opt_auto = bool(settings_store.get(db, "opt_auto"))
+    return placed, fills_, opt_events, alerts, opt_auto
+
+
+async def poll_once(client, now: datetime | None = None) -> list[dict]:
+    """One price poll. The database work runs in a worker thread, so the pages and the other jobs never wait for it,
+    and the prices are pushed to the pages first, before the fills and alerts are worked out."""
+    now = now or now_ist()
+    keys = await asyncio.to_thread(_round_keys, now)
+    if not keys:
+        return []
+    prices = await client.ltp(keys)
+    state["prices"].update(prices)
+    state["last_poll"], state["error"] = now, None
     await hub.broadcast({"type": "prices", "data": prices, "time": now.isoformat(timespec="seconds")})
+    placed, fills_, opt_events, alerts, opt_auto = await asyncio.to_thread(_round_apply, prices, now)
     for a in alerts:
         await hub.broadcast(a)
         telegram.notify(telegram.alert_text(a))
@@ -127,7 +159,34 @@ async def poll_once(client, now: datetime | None = None) -> list[dict]:
         telegram.notify(telegram.paper_text(e))
     if placed and not fills_:
         await hub.broadcast({"type": "paper", "event": "order placed"})
+    for e in opt_events:
+        await hub.broadcast(e)
+        telegram.notify(f"Option paper: {e['label']} {e['event']}" + (f" ({e['reason']})" if e.get("reason") else ""))
+    if opt_auto:
+        start_option_auto(client, now, prices)
     return alerts
+
+
+_option_task: asyncio.Task | None = None
+
+
+def start_option_auto(client, now: datetime, prices: dict) -> None:
+    """Automatic option orders fetch the option chain of each new signal: that runs as its own background task (one
+    at a time), never inside the price round."""
+    global _option_task
+    if _option_task is not None and not _option_task.done():
+        return
+    _option_task = asyncio.get_running_loop().create_task(_option_auto(client, now, dict(prices)))
+
+
+async def _option_auto(client, now: datetime, prices: dict) -> None:
+    try:
+        with SessionLocal() as db:
+            got = await optionpaper.auto_place(db, client, watch_rows(db), now, prices)
+        if got["placed"]:
+            await hub.broadcast({"type": "option-paper", "event": "order placed"})
+    except Exception as exc:                              # shown on the feed status, never stops the price round
+        state["option_auto_error"] = f"{type(exc).__name__}: {exc}"
 
 
 async def poller(client) -> None:

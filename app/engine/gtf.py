@@ -2,8 +2,17 @@
 gives the execution zone. Pure functions on zone-like objects and arrays, shared by the live scan and the backtest."""
 import numpy as np
 
+from ..config import MODES
 from .lifecycle import ACTIVE, counted_tests
-from .score import entry_kind, htf_score, ltf_score
+from .score import entry_kind, htf_score, ltf_score, parts
+
+
+def usable_htf(zones: list, th: dict) -> list:
+    """The HTF zones that can mark the curve: active, scored at least min_htf_score and, with htf_zone_pick "fresh"
+    (the default), never come back to."""
+    floor = float(th.get("min_htf_score") or 0)
+    fresh_only = (th.get("htf_zone_pick") or "fresh") == "fresh"
+    return [z for z in zones if z.status in ACTIVE and htf_score(z, th)[0] >= floor and not (fresh_only and int(z.touches or 0) > 0)]
 
 
 def nearest_zones(zones: list, cmp: float, th: dict):
@@ -47,21 +56,42 @@ def htf_trend(closes: np.ndarray, nd, ns) -> str:
     return "SIDEWAYS"
 
 
-def itf_trend(closes: np.ndarray) -> dict:
-    """Slope of the 50 SMA over 7 bars. With fewer bars a shorter SMA is used, and with under 20 the raw 7-bar slope."""
+def avg_move(closes: np.ndarray, n: int = 14) -> float:
+    """Average move per candle: the mean of the last n close-to-close changes, a close-only stand-in for the ATR."""
+    if len(closes) < 2:
+        return 0.0
+    return float(np.mean(np.abs(np.diff(closes[-(n + 1):]))))
+
+
+def itf_trend(closes: np.ndarray, th: dict | None = None) -> dict:
+    """Slope of the 50 SMA over 7 bars. With fewer bars a shorter SMA is used, and with under 20 the raw 7-bar slope.
+
+    The slope must pass a threshold to count as up or down:
+    - rule "pct" (the default, scanner.py): itf_slope_pct (0.05) % of price; 10 times that with a shorter SMA and
+      40 times with the raw slope, as scanner.py widens it.
+    - rule "atr": itf_atr_mult times the average move per candle of the last 14 candles; 5 times that with a shorter
+      SMA and 15 times with the raw slope. It follows how much each stock moves on each timeframe."""
     n = len(closes)
     if n < 7:
         return {"trend": "SIDEWAYS", "reason": f"only {n} candles (7 needed)"}
+    th = th or {}
+    rule = th.get("itf_rule") or "pct"
+    price = float(closes[-1])
+    if rule == "atr":
+        unit, widen = float(th.get("itf_atr_mult") or 0.1) * avg_move(closes), (1, 5, 15)
+    else:
+        unit, widen = price * float(th.get("itf_slope_pct") or 0.05) / 100.0, (1, 10, 40)
     if n >= 57:
         sma = np.convolve(closes[-57:], np.ones(50) / 50, mode="valid")
-        slope, limit, why = float(sma[-1] - sma[0]), float(closes[-1]) * 0.0005, "50 SMA slope over 7 bars"
+        slope, limit, why = float(sma[-1] - sma[0]), unit * widen[0], "50 SMA slope over 7 bars"
     elif n >= 20:
         period = min(n - 7, 50)
         sma = np.convolve(closes[-(period + 7):], np.ones(period) / period, mode="valid")
-        slope, limit, why = float(sma[-1] - sma[0]), float(closes[-1]) * 0.005, f"{period} SMA slope over 7 bars ({n} candles)"
+        slope, limit, why = float(sma[-1] - sma[0]), unit * widen[1], f"{period} SMA slope over 7 bars ({n} candles)"
     else:
-        slope, limit, why = float(closes[-1] - closes[-7]), float(closes[-1]) * 0.02, f"price slope over 7 bars ({n} candles)"
-    return {"trend": "UP" if slope > limit else "DOWN" if slope < -limit else "SIDEWAYS", "reason": f"{why} = {slope:.4f}"}
+        slope, limit, why = float(closes[-1] - closes[-7]), unit * widen[2], f"price slope over 7 bars ({n} candles)"
+    return {"trend": "UP" if slope > limit else "DOWN" if slope < -limit else "SIDEWAYS",
+            "reason": f"{why} = {slope:.4f}, needs more than {limit:.4f} ({'ATR rule' if rule == 'atr' else 'percent rule'})"}
 
 
 def direction_filter(band: str, itf: str, rule: str = "location") -> str:
@@ -94,7 +124,7 @@ def context(htf_zones: list, htf_closes: np.ndarray, itf_closes: np.ndarray, cmp
     band = curve(cmp, nd, ns)
     rule = th.get("direction_rule") or "location"
     h_trend = htf_trend(htf_closes, nd, ns) if len(htf_closes) else "SIDEWAYS"
-    itf = itf_trend(itf_closes)
+    itf = itf_trend(itf_closes, th)
     if nd and ns:
         state, side = "NORMAL", direction_filter(band, itf["trend"], rule)
     elif nd:       # every supply above has been used up: price is expanding higher
@@ -114,8 +144,87 @@ def ltf_ok(z) -> bool:
     return bool(z.legin_explosive) and z.pattern in ("DBR", "RBD")
 
 
-def candidates(ltf_zones: list, ctx: dict, cmp: float, ema, th: dict) -> list[tuple]:
-    """Execution zones for the trade side, lying between price and the HTF zone. Returns (zone, score, label), best first."""
+def next_htf(mode: str) -> str | None:
+    """The timeframe one step above a mode's HTF: the next mode's HTF (4HR -> 1d, DAILY -> 1w), None for the top one."""
+    names = list(MODES)
+    k = names.index(mode) if mode in names else -1
+    return MODES[names[k + 1]][0] if 0 <= k < len(names) - 1 else None
+
+
+def strong_legout(z, th: dict) -> bool:
+    """Price left the zone with a gap or two exciting candles (strength 2 of the trade score)."""
+    return parts(z, th)["strength"] >= 2
+
+
+def stop_pct(z) -> float:
+    """Distance from the proximal line (the entry of type 1) to the distal line (the stop), as a % of the entry."""
+    return abs(float(z.proximal) - float(z.distal)) / abs(float(z.proximal)) * 100.0 if z.proximal else 0.0
+
+
+def reaction_of(z, zones: list, th: dict):
+    """GTF PDF p.35-36, credibility: the earlier zone of the same side whose reaction this zone formed in (the two
+    overlap: this zone's base sits on the earlier zone), or None when the zone is authentic. A zone whose leg-out is
+    strong is tradeable all the same, so it returns None too."""
+    if strong_legout(z, th):
+        return None
+    lo, hi = sorted((float(z.proximal), float(z.distal)))
+    for o in zones:
+        if o is z or o.side != z.side or o.created_ts is None or z.created_ts is None or o.created_ts >= z.created_ts:
+            continue
+        o_lo, o_hi = sorted((float(o.proximal), float(o.distal)))
+        if lo <= o_hi and o_lo <= hi:
+            return o
+    return None
+
+
+def blocked_above(z, above: list, th: dict):
+    """GTF PDF p.30: the fresh opposite zone one timeframe above the HTF that lies between the entry (the proximal
+    line) and the target, or None. Buying at demand right under a higher supply usually ends at the stop."""
+    entry, stop = float(z.proximal), float(z.distal)
+    target = entry + (1 if z.side == "demand" else -1) * float(th.get("target_rr") or 2) * abs(entry - stop)
+    for o in above:
+        if z.side == "demand" and o.side == "supply" and o.proximal < target and o.distal > entry:
+            return o
+        if z.side == "supply" and o.side == "demand" and o.proximal > target and o.distal < entry:
+            return o
+    return None
+
+
+def not_traded(z, ltf_zones: list, ctx: dict, th: dict) -> str | None:
+    """Why an execution zone is left out by the trade filters of the Settings page (all off by default), or None:
+    base candle limits, minimum stop distance, reaction zones (GTF PDF p.35-36), next HTF zone in the way (p.30)."""
+    why = base_count_off(z, th)
+    least = float(th.get("min_stop_pct") or 0)
+    if not why and least > 0 and stop_pct(z) < least:
+        why = f"zone too thin: stop {stop_pct(z):.2f}% away, minimum {least:g}%"
+    if not why and th.get("skip_reaction_zones"):
+        o = reaction_of(z, ltf_zones, th)
+        if o is not None:
+            why = (f"formed in the reaction of the earlier {o.side} zone {o.proximal:g} to {o.distal:g} and its leg-out is not "
+                   "strong (GTF credibility)")
+    if not why and th.get("check_next_htf") and ctx.get("above"):
+        o = blocked_above(z, ctx["above"], th)
+        if o is not None:
+            why = f"a fresh {ctx.get('above_tf') or 'higher'} {o.side} zone {o.proximal:g} to {o.distal:g} lies between the entry and the target (GTF caution)"
+    return why
+
+
+def base_count_off(z, th: dict) -> str | None:
+    """Why an execution zone is not traded under the minimum and maximum base candles settings (ltf_min_bases,
+    ltf_max_bases), or None. Both are off at 0. They choose which LTF zones are traded; they never change how zones
+    are found, tested or scored, and HTF zones are never filtered by them."""
+    n = int(z.base_count or 0)
+    least, most = int(th.get("ltf_min_bases") or 0), int(th.get("ltf_max_bases") or 0)
+    if least > 0 and n < least:
+        return f"{n} base candle{'s' if n != 1 else ''}, minimum {least}"
+    if most > 0 and n > most:
+        return f"{n} base candles, maximum {most}"
+    return None
+
+
+def candidates(ltf_zones: list, ctx: dict, cmp: float, ema, th: dict, skipped: list | None = None) -> list[tuple]:
+    """Execution zones for the trade side, lying between price and the HTF zone. Returns (zone, score, label), best first.
+    Zones left out by the trade filters (not_traded) go to `skipped` as (zone, reason)."""
     hz, side = ctx["htf_zone"], ctx["side"]
     if hz is None or side == "NONE":
         return []
@@ -131,6 +240,11 @@ def candidates(ltf_zones: list, ctx: dict, cmp: float, ema, th: dict) -> list[tu
         if not placed:
             continue
         if abs(cmp - z.proximal) / cmp * 100 > th["ltf_max_gap_pct"]:
+            continue
+        why = not_traded(z, ltf_zones, ctx, th)
+        if why:
+            if skipped is not None:
+                skipped.append((z, why))
             continue
         total, label = ltf_score(z, ema, th)
         if total > 0:

@@ -33,6 +33,7 @@ class Instrument(Base):
     expiry: Mapped[datetime | None] = mapped_column(DateTime)
     strike: Mapped[float | None] = mapped_column(Double)
     underlying_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    tick_size: Mapped[float | None] = mapped_column(Double)   # in rupees (Upstox gives paise for NSE: 5 = 0.05)
 
 
 class Candle(Base):
@@ -56,6 +57,9 @@ class SyncState(Base):
     last_scanned_ts: Mapped[datetime | None] = mapped_column(DateTime)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime)
     gaps: Mapped[int] = mapped_column(Integer, default=0)
+    # candles stored for this instrument and timeframe, kept up to date at each sync so the Data page never counts
+    # the whole candles table (None: not counted yet; filled once in the background at start-up)
+    candles: Mapped[int | None] = mapped_column(Integer)
 
 
 class Zone(Base):
@@ -127,6 +131,7 @@ class TradePlan(Base):
     reward_risk: Mapped[float] = mapped_column(Double)
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|triggered|target_hit|stopped|cancelled
     is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    is_default: Mapped[bool | None] = mapped_column(Boolean)   # the mode's best LTF zone (the one the dashboard signal uses)
     location_pos: Mapped[float | None] = mapped_column(Double)
     trend: Mapped[str | None] = mapped_column(String(16))
     allowed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -197,6 +202,65 @@ class PaperTrade(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(16))   # stop | target | manual
     checked_ts: Mapped[datetime | None] = mapped_column(DateTime)
     history: Mapped[list | None] = mapped_column(JSONText)
+    # trailing stop settings and state, kept for the life of the position (None: no trailing, the stop stays put)
+    trail: Mapped[dict | None] = mapped_column(JSONText)
+
+
+class OptionPaperTrade(Base):
+    """One option paper trade, from the order to the close: status pending, open, closed or cancelled. The option is
+    bought (a call on a BUY signal, a put on a SELL signal); entry, stop, target and trailing follow the stock's price."""
+    __tablename__ = "option_paper"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(12), default="pending", index=True)
+    underlying_key: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    mode: Mapped[str | None] = mapped_column(String(12))
+    timeframe: Mapped[str | None] = mapped_column(String(8))
+    zone_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    plan_id: Mapped[int | None] = mapped_column(Integer)
+    signal: Mapped[str] = mapped_column(String(4))               # BUY | SELL
+    score: Mapped[float | None] = mapped_column(Double)
+    entry_type: Mapped[str | None] = mapped_column(String(8))
+    signal_ts: Mapped[datetime | None] = mapped_column(DateTime)
+    option_key: Mapped[str | None] = mapped_column(String(64), index=True)
+    option_label: Mapped[str | None] = mapped_column(String(100))
+    option_type: Mapped[str | None] = mapped_column(String(2))     # CE | PE
+    strike: Mapped[float | None] = mapped_column(Double)
+    expiry: Mapped[str | None] = mapped_column(String(10))
+    strike_rule: Mapped[str | None] = mapped_column(String(8))
+    delta: Mapped[float | None] = mapped_column(Double)
+    gamma: Mapped[float | None] = mapped_column(Double)
+    placed_by: Mapped[str | None] = mapped_column(String(8))    # you | auto
+    lot_size: Mapped[int | None] = mapped_column(Integer)
+    lots: Mapped[int | None] = mapped_column(Integer)
+    quantity: Mapped[int | None] = mapped_column(Integer)
+    entry: Mapped[float] = mapped_column(Double)                 # on the stock
+    stop: Mapped[float] = mapped_column(Double)
+    target: Mapped[float] = mapped_column(Double)
+    first_stop: Mapped[float | None] = mapped_column(Double)
+    first_target: Mapped[float | None] = mapped_column(Double)
+    est_entry: Mapped[float | None] = mapped_column(Double)      # estimated premiums at the stock's entry, stop and target
+    est_stop: Mapped[float | None] = mapped_column(Double)
+    est_target: Mapped[float | None] = mapped_column(Double)
+    risk_amount: Mapped[float | None] = mapped_column(Double)    # rupees lost at the stop (estimated): 1 R
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    note: Mapped[str | None] = mapped_column(String(255))
+    fill_ts: Mapped[datetime | None] = mapped_column(DateTime)
+    fill_premium: Mapped[float | None] = mapped_column(Double)
+    fill_spot: Mapped[float | None] = mapped_column(Double)
+    exit_ts: Mapped[datetime | None] = mapped_column(DateTime)
+    exit_premium: Mapped[float | None] = mapped_column(Double)
+    exit_spot: Mapped[float | None] = mapped_column(Double)
+    exit_reason: Mapped[str | None] = mapped_column(String(16))  # stop | trail | target | premium stop | expiry | manual
+    pnl: Mapped[float | None] = mapped_column(Double)
+    charges: Mapped[float | None] = mapped_column(Double)
+    result_r: Mapped[float | None] = mapped_column(Double)
+    last_premium: Mapped[float | None] = mapped_column(Double)
+    last_spot: Mapped[float | None] = mapped_column(Double)
+    best_spot: Mapped[float | None] = mapped_column(Double)
+    trail: Mapped[dict | None] = mapped_column(JSONText)
+    history: Mapped[list | None] = mapped_column(JSONText)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class BacktestRun(Base):
@@ -291,6 +355,18 @@ class ModeResult(Base):
     instrument_key: Mapped[str] = mapped_column(String(64), primary_key=True)
     mode: Mapped[str] = mapped_column(String(12), primary_key=True)
     signal: Mapped[str | None] = mapped_column(String(12))
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    data: Mapped[dict | None] = mapped_column(JSONText)
+    signal_since: Mapped[datetime | None] = mapped_column(DateTime)   # when this signal (buy, sell, no trade) first appeared
+
+
+class EyeRow(Base):
+    """What the GTF EYE and Premium pages need for one instrument in one mode, saved at the end of each scan so the
+    pages read every instrument in one query: the active HTF zones (with their score), the last closed HTF candles,
+    daily ATR %, IV and the saved GTF signal. The live price is applied when the page asks."""
+    __tablename__ = "eye_rows"
+    instrument_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(12), primary_key=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
     data: Mapped[dict | None] = mapped_column(JSONText)
 

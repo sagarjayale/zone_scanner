@@ -7,6 +7,14 @@ def entry_touched(side: str, entry: float, high: float, low: float) -> bool:
     return low <= entry if side == "demand" else high >= entry
 
 
+def limit_fill_price(side: str, entry: float, open_: float) -> float:
+    """The price a limit order at `entry` fills at on a candle that reaches it. If the candle opens beyond the entry (a
+    gap at the open), the limit fills at the open: a better price than the limit, but nearer the stop."""
+    if side == "demand":
+        return float(open_) if open_ < entry else float(entry)
+    return float(open_) if open_ > entry else float(entry)
+
+
 def stop_hit(side: str, stop: float, high: float, low: float) -> bool:
     return low <= stop if side == "demand" else high >= stop
 

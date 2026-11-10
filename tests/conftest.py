@@ -24,3 +24,26 @@ with SessionLocal() as _db:      # the test database starts on the current rules
     # (test_scanner_rules.py), which switch to it where they need the database.
     settings_store.put(_db, "marking_rule", "pdf")
     settings_store.put(_db, "zone_history", "all")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _trailing_off_for_older_tests(request):
+    """The trailing stop is on by default (lock, on live prices). Most tests were written with it off and check one
+    rule at a time, so each test starts with it off; tests marked trailing_default see the real defaults."""
+    with SessionLocal() as db:
+        if request.node.get_closest_marker("trailing_default"):
+            from app.models import Setting
+            row = db.get(Setting, "trail_method")
+            if row is not None:
+                db.delete(row)
+                db.commit()
+        else:
+            settings_store.put(db, "trail_method", "off")
+    yield
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "trailing_default: run with the real trailing defaults (lock on live prices)")
