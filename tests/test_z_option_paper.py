@@ -152,7 +152,7 @@ def test_place_wait_fill_trail_and_stop():
             # back down through the locked stop: the option is sold at its live price
             ev = optionpaper.on_prices(db, {key: t.stop - 0.1, f"{under}C530": 4.0}, NOW + timedelta(minutes=9))
             assert [e["event"] for e in ev] == ["closed"] and (t.exit_reason, t.exit_premium) == ("trail", 4.0)
-            assert t.pnl == pytest.approx((4.0 - 3.4) * t.quantity) and t.charges > 40 and t.result_r == pytest.approx((t.pnl - t.charges) / t.risk_amount, abs=1e-3)
+            assert t.pnl == pytest.approx((4.0 - 3.4) * t.quantity) and t.charges > 0 and t.result_r == pytest.approx((t.pnl - t.charges) / t.risk_amount, abs=1e-3)
         finally:
             _unset(db, "opt_paper_capital", "trail_method", "trail_lock_pct", "trail_lock_gap_pct", "trail_tf")
             _clear(db, key)
@@ -381,3 +381,92 @@ def test_options_shown_for_signals_are_in_the_price_round():
         keys = optionpaper.watch_keys(db, NOW)
     assert "NSE_FO|SHOWN1" in keys and "NSE_FO|OLD1" not in keys
     optionpaper._previews.clear()
+
+
+def test_trailing_cell_and_apply_trailing_and_distance(monkeypatch):
+    """An open option position shows the Paper page's trailing view on the stock's price (steps, ladder, what the stop
+    keeps in option rupees); one filled with trailing off gets it with Apply trailing; pending orders show the
+    distance to the entry."""
+    key, under = "NSE_EQ|OPT9", "OPI"
+    plan_id = setup(key, under)
+    monkeypatch.setattr("app.main.data_sync.now_ist", lambda: NOW)
+    with SessionLocal() as db:
+        from app.models import TradePlan
+        t = asyncio.run(optionpaper.place(db, FakeClient(530.0, under), db.get(TradePlan, plan_id), NOW))["placed"]
+        optionpaper.on_prices(db, {key: 521.0, t.option_key: 3.5}, NOW)            # trailing off (the tests' default)
+        tid = t.id
+        step = (t.first_target - 521.0) / 10
+        optionpaper.on_prices(db, {key: 521.0 + step * 2.5, t.option_key: 5.0}, NOW + timedelta(minutes=5))   # best so far
+    with TestClient(app) as c:
+        v = c.get("/api/option-paper/positions").json()["open"][0]["lock"]
+        assert v["method"] == "off" and v["premium_at_stop"] is not None
+        assert c.post(f"/api/option-paper/{tid}/trail").status_code == 400           # Settings still off: says why
+        with SessionLocal() as db:
+            for k, val in {"trail_method": "lock", "trail_lock_pct": 10, "trail_lock_gap_pct": 20, "trail_tf": "live"}.items():
+                settings_store.put(db, k, val)
+        try:
+            r = c.post(f"/api/option-paper/{tid}/trail").json()
+            assert r["stop"] == pytest.approx(round(521.0 + 2 * step, 2))           # steps 1 and 2 passed already: locked at once
+            v = r["lock"]
+            assert (v["method"], v["steps"], v["steps_to_target"], v["live"]) == ("lock", 2, 10, True)
+            assert v["locked_inr"] == pytest.approx((v["premium_at_stop"] - 3.5) * r["quantity"], abs=0.01) and v["locked_after_charges"] < v["locked_inr"]
+            assert v["next_trigger"] > r["stop"] and len(v["levels"]) >= 2
+        finally:
+            with SessionLocal() as db:
+                _unset(db, "trail_method", "trail_lock_pct", "trail_lock_gap_pct", "trail_tf")
+        page = c.get("/option-paper").text
+        assert "<th>Option</th><th>Distance to entry</th><th>Strike</th>" in page and 'id="near-chips"' in page
+        js = c.get("/static/js/optionpaper.js").text
+        assert "trailLines(asStock(t)" in js and "Apply trailing from Settings" in js and "entryDistance(asOrder(o)" in js
+    with SessionLocal() as db:
+        _clear(db, key)
+
+
+def test_automatic_option_controls_like_the_paper_page():
+    with TestClient(app) as c:
+        page = c.get("/option-paper").text
+        bar = page[page.index('<div class="actions">'):]
+        assert page.index('id="opt_auto"') < page.index("<details")             # above the settings, like the Paper page
+        bar = bar[:bar.index("</div>")]
+        assert 'id="opt_auto"' in bar and '<select id="opt_auto_min_score"' in bar and 'id="opt_auto_closed"' in bar and 'id="auto-run"' in bar
+        js = c.get("/static/js/optionpaper.js").text
+        assert '$("opt_auto").onchange = saveAuto' in js and '$("opt_auto_closed").onchange' in js
+        assert c.put("/api/settings", json={"opt_auto": True, "opt_auto_min_score": 7}).status_code == 200
+        s = c.get("/api/option-paper/positions").json()["settings"]
+        assert (s["opt_auto"], s["opt_auto_min_score"]) == (True, 7)
+    with SessionLocal() as db:
+        _unset(db, "opt_auto", "opt_auto_min_score")
+
+
+def test_fixed_lots_per_order():
+    from app.config import DEFAULTS
+    assert (DEFAULTS["opt_lot_mode"], DEFAULTS["opt_fixed_lots"], DEFAULTS["opt_max_risk"]) == ("fixed", 1, 0.0)
+    leg = _leg("K", 10.0, 0.5)               # 1 lot of 100 risks 440 (premium 5.2 -> 0.8), costs 520
+    one = optionpaper.size(leg, 530.0, 520.0, 510.0, 540.0, 100, budget=100, max_premium=100000, mode="fixed")
+    assert (one["lots"], one["risk_per_lot"]) == (1, 440.0)                     # the ₹100 budget does not matter
+    assert optionpaper.size(leg, 530.0, 520.0, 510.0, 540.0, 100, 100, 100000, "fixed", 3)["lots"] == 3
+    assert "above your limit of ₹1,000" in optionpaper.size(leg, 530.0, 520.0, 510.0, 540.0, 100, 100, 100000, "fixed", 3, 1000)["why"]
+    assert "above the premium limit" in optionpaper.size(leg, 530.0, 520.0, 510.0, 540.0, 100, 100, 1000, "fixed", 2)["why"]
+    key, under = "NSE_EQ|OPT10", "OPJ"
+    plan_id = setup(key, under)
+    with SessionLocal() as db:
+        from app.models import TradePlan
+        settings_store.put(db, "opt_paper_risk_pct", 0.001)                    # ₹5 of ₹5 lakh: too little for "by risk"
+        try:
+            settings_store.put(db, "opt_lot_mode", "risk")
+            got = asyncio.run(optionpaper.place(db, FakeClient(530.0, under), db.get(TradePlan, plan_id), NOW))
+            assert "skipped" in got and "above your ₹5 per trade" in got["skipped"]
+            settings_store.put(db, "opt_lot_mode", "fixed")
+            t = asyncio.run(optionpaper.place(db, FakeClient(530.0, under), db.get(TradePlan, plan_id), NOW))["placed"]
+            assert (t.lots, t.quantity) == (1, LOT) and t.risk_amount > 5                  # 1 lot; its own risk is 1 R
+        finally:
+            _unset(db, "opt_paper_risk_pct", "opt_lot_mode")
+            _clear(db, key)
+    with TestClient(app) as c:
+        assert c.put("/api/settings", json={"opt_lot_mode": "all"}).status_code == 400
+        assert c.put("/api/settings", json={"opt_fixed_lots": 1.5}).status_code == 400
+        assert c.put("/api/settings", json={"opt_lot_mode": "fixed", "opt_fixed_lots": 1, "opt_max_risk": 0}).status_code == 200
+        page = c.get("/option-paper").text
+        assert 'id="opt_lot_mode"' in page and 'id="opt_fixed_lots"' in page and 'id="opt_max_risk"' in page
+    with SessionLocal() as db:
+        _unset(db, "opt_lot_mode", "opt_fixed_lots", "opt_max_risk")

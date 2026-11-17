@@ -4,8 +4,8 @@ const stamp = (s) => (s ? String(s).replace("T", " ").slice(0, 16) : "");
 function say(text, isError = false) { $("status").textContent = text; $("status").className = "status" + (isError ? " err" : ""); }
 const prices = {};
 let data = null, lastPrice = 0;
-const SETTINGS = ["opt_paper_capital", "opt_paper_risk_pct", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_expiry_close",
-  "opt_premium_stop_pct", "opt_auto_min_score"];
+const SETTINGS = ["opt_paper_capital", "opt_paper_risk_pct", "opt_fixed_lots", "opt_max_risk", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_expiry_close",
+  "opt_premium_stop_pct"];
 const WHY = { stop: "Stop (stock)", trail: "Trailing stop", target: "Target (stock)", "premium stop": "Premium stop", expiry: "Expiry day", manual: "Closed by you" };
 const sigTag = (s) => el("span", { class: "tag " + (s === "BUY" ? "demand" : "supply") }, s === "BUY" ? "BUY → CE" : "SELL → PE");
 const tfOf = (x) => tfText(x.mode, x.timeframe);
@@ -24,12 +24,34 @@ function figures() {
     : age == null ? "🟡 Waiting for live prices…" : age <= 15 ? `🟢 Live · last price ${age} s ago` : `🔴 No price for ${age} s: reconnecting`;
 }
 
-function lockText(t) {
-  const k = t.lock;
-  if (!k) return (t.trail && t.trail.trail_method) ? `${t.trail.trail_method}: stop ${fmtPrice(t.stop)}` : "No trailing";
-  const head = k.steps > 0 ? `🔒 Step ${k.steps} of ${k.steps_to_target}` : `🔓 Not locked yet · Step 0 of ${k.steps_to_target}`;
-  return [head, el("span", { class: "sub" }, `next: stop ${fmtPrice(k.next_stop)} when the stock reaches ${fmtPrice(k.next_trigger)}`)];
+// The Trailing / locked cell: the same lines and step ladder as the Paper page, on the stock's price, with what the
+// stop keeps in rupees of the option (its estimated premium at the stop).
+function asStock(t) { return { side: t.signal === "BUY" ? "demand" : "supply", fill_price: t.fill_spot, stop: t.stop, trail_view: t.lock || {} }; }
+function trailCell(t, spot) {
+  const tv = trailLines(asStock(t), spot, 0.05);
+  const off = !t.lock || !t.lock.method || t.lock.method === "off";
+  return { tv, cell: el("td", { class: "trail-cell" },
+    ...tv.gold.map((g) => el("span", { class: "trail-gold" }, g)),
+    el("span", { class: "trail-head" }, tv.lines[0]),
+    ...(tv.ladder ? [ladderBar(tv.ladder)] : []),
+    ...tv.lines.slice(1).map((x) => el("span", { class: "sub wrap" }, x)),
+    t.lock && t.lock.premium_at_stop != null ? el("span", { class: "sub wrap" }, `Option at the stop: about ${fmtPrice(t.lock.premium_at_stop)}`) : "",
+    off ? rowBtn("Apply trailing from Settings", () => act(`Trailing applied to ${t.option_label}.`, () => post(`/api/option-paper/${t.id}/trail`)), "btn trail-apply") : "") };
 }
+function ladderBar(L) {
+  const bar = el("div", { class: "ladder", role: "img", "aria-label": `Steps from the entry ${L.entry} to the target ${L.target}` });
+  bar.append(el("div", { class: "ladder-fill", style: `width:${(L.filled * 100).toFixed(1)}%` }));
+  for (const tk of L.ticks) bar.append(el("span", { class: "ladder-tick " + tk.kind, style: `left:${(tk.x * 100).toFixed(1)}%` }));
+  bar.append(el("span", { class: "ladder-tick target", style: "left:100%" }));
+  if (L.dot != null) bar.append(el("span", { class: "ladder-dot" + (L.losing ? " losing" : ""), style: `left:${(L.dot * 100).toFixed(1)}%` }));
+  return el("div", { class: "ladder-wrap" }, bar, el("div", { class: "ladder-ends" }, el("span", {}, L.entry), el("span", {}, `🎯 ${L.target}`)));
+}
+
+// Pending orders: how near the stock is to the entry, in R (entry to stop), like the Paper page.
+const history = {};
+const PICK_KEY = "zoneScanner.optionNear";
+let pick = (() => { try { return localStorage.getItem(PICK_KEY) || "all"; } catch (e) { return "all"; } })();
+const asOrder = (o) => ({ entry: o.entry, stop: o.stop, side: o.signal === "BUY" ? "demand" : "supply" });
 
 function rowBtn(label, fn, cls = "btn") { return el("button", { class: cls, onclick: fn }, label); }
 
@@ -52,8 +74,12 @@ function render() {
     const p = premOf(t), sp = spotOf(t), pnl = p == null ? null : (p - t.fill_premium) * t.quantity;
     const chg = p == null ? null : 100 * (p - t.fill_premium) / t.fill_premium;
     const r = pnl != null && t.risk_amount ? pnl / t.risk_amount : null;
-    open.append(el("tr", {},
-      optCell(t), strikeCell(t),
+    const tc = trailCell(t, sp);
+    const cls = [tc.tv.locked ? "pos-locked" : "", tc.tv.nearStop ? "near-stop" : ""].filter(Boolean).join(" ");
+    open.append(el("tr", { class: cls },
+      el("td", {}, el("strong", {}, t.option_label), el("span", { class: "sub" }, `${t.signal} · ${tfOf(t)}`),
+        tc.tv.nearStop ? el("span", { class: "near-stop-label" }, "near the stop") : ""),
+      strikeCell(t),
       el("td", { class: "when" }, el("strong", {}, fmtPrice(t.fill_premium)), el("span", { class: "sub" }, `${stamp(t.fill_ts)}, stock ${fmtPrice(t.fill_spot)}`)),
       el("td", { class: "num" }, p == null ? "no price" : el("strong", {}, fmtPrice(p)),
         el("span", { class: "sub " + (chg > 0 ? "win" : chg < 0 ? "loss" : "") }, chg == null ? "" : `${chg > 0 ? "+" : ""}${chg.toFixed(1)}%${data.market_open ? "" : " · last close"}`)),
@@ -63,29 +89,11 @@ function render() {
       el("td", { class: "num " + (pnl > 0 ? "win" : pnl < 0 ? "loss" : "") }, pnl == null ? "" : el("strong", {}, signed(pnl)),
         el("span", { class: "sub" }, r == null ? "" : `${r > 0 ? "+" : ""}${r.toFixed(2)} R`)),
       el("td", { class: "num" }, `${sp == null ? "" : fmtPrice(sp)} / ${fmtPrice(t.stop)}${t.stop !== t.first_stop ? " 🔒" : ""} / ${fmtPrice(t.target)}`),
-      el("td", {}, ...[].concat(lockText(t))),
+      tc.cell,
       el("td", {}, durationText(t.open_s), el("span", { class: "sub" }, `${t.lots} × ${t.lot_size}`)),
       el("td", {}, rowBtn("Close now", () => act("Position closed at the option's last price.", () => post(`/api/option-paper/${t.id}/close`))))));
   }
-  const pend = $("pending"); pend.replaceChildren();
-  if (!data.pending.length) pend.append(el("tr", {}, el("td", { colspan: "12" }, "No pending option orders.")));
-  for (const o of data.pending) {
-    const sp = spotOf(o), sign = o.signal === "BUY" ? 1 : -1;
-    const away = sp == null ? null : 100 * sign * (sp - o.entry) / o.entry;
-    pend.append(el("tr", {},
-      optCell(o), strikeCell(o),
-      el("td", {}, o.expiry || "", el("span", { class: "sub" }, o.days_left == null ? "" : `${o.days_left} days`)),
-      premCell(o),
-      est(o.est_entry_now ?? o.est_entry, o.entry, "when stock"),
-      est(o.est_stop_now ?? o.est_stop, o.stop, "when stock"),
-      est(o.est_target_now ?? o.est_target, o.target, "when stock"),
-      el("td", { class: "num" }, `${o.lots} × ${o.lot_size}`, el("span", { class: "sub" }, `≈ ₹${money(o.cost)}`)),
-      el("td", { class: "num" }, `₹${money(o.risk_amount)}`),
-      el("td", { class: "num" }, `${sp == null ? "" : fmtPrice(sp)} → ${fmtPrice(o.entry)}`,
-        el("span", { class: "sub" }, away == null ? "" : away <= 0 ? "at the entry" : `${away.toFixed(2)}% away`), o.note && o.note.startsWith("waiting") ? el("span", { class: "sub loss" }, o.note) : ""),
-      el("td", { class: "when" }, stamp(o.created_at), el("span", { class: "sub" }, o.placed_by === "auto" ? (o.note || "auto") : "by you")),
-      el("td", {}, rowBtn("Cancel", () => act("Order cancelled.", () => post(`/api/option-paper/${o.id}/close`))))));
-  }
+  renderPending();
   const sig = $("signals"); sig.replaceChildren();
   if (!data.signals.length) sig.append(el("tr", {}, el("td", { colspan: "10" }, "No signal on a stock with options right now. Signals appear after a scan finds a fresh zone the curve and trend allow; stocks without options are not shown here.")));
   for (const s of data.signals) {
@@ -135,6 +143,48 @@ function render() {
 }
 
 // The option each signal would get, asked a few signals at a time so the first ones show quickly.
+function renderPending() {
+  const now = Date.now(), closedMarket = !data.market_open;
+  const rows = data.pending.map((o) => {
+    const sp = spotOf(o), d = entryDistance(asOrder(o), sp);
+    const speed = closedMarket ? { text: "market closed" } : entrySpeed(asOrder(o), history[o.underlying_key], now);
+    return { o, sp, d, speed };
+  }).sort((a, b) => (a.d ? a.d.r : 1e9) - (b.d ? b.d.r : 1e9));
+  const counts = { all: rows.length };
+  for (const g of NEAR_GROUPS) counts[g.key] = rows.filter((x) => x.d && x.d.group === g.key).length;
+  const chips = $("near-chips"); chips.replaceChildren();
+  for (const [key, text] of [...NEAR_GROUPS.map((g) => [g.key, `${g.icon} ${g.label}`]), ["all", "All"]]) {
+    chips.append(el("button", { class: "chip near-" + key, "aria-pressed": String(pick === key),
+      onclick: () => { pick = key; try { localStorage.setItem(PICK_KEY, key); } catch (e) { /* storage not available */ } renderPending(); } }, `${text} ${counts[key]}`));
+  }
+  const pend = $("pending"); pend.replaceChildren();
+  const shown = rows.filter((x) => pick === "all" || (x.d && x.d.group === pick));
+  if (!data.pending.length) pend.append(el("tr", {}, el("td", { colspan: "13" }, "No pending option orders.")));
+  else if (!shown.length) pend.append(el("tr", {}, el("td", { colspan: "13" }, "No pending order in this group right now. Press All to see every order.")));
+  const delay = `${-(now % 1600)}ms`;
+  for (const { o, sp, d, speed } of shown) {
+    const g = d ? NEAR_GROUPS.find((x) => x.key === d.group) : null;
+    const dist = !d ? el("td", { class: "near" }, el("span", { class: "sub" }, "no live price yet"))
+      : el("td", { class: "near" }, el("span", { class: "near-badge near-" + d.group, style: d.group === "now" ? `animation-delay:${delay}` : "" }, `${g.icon} ${g.label.toUpperCase()}`),
+        el("span", { class: "near-line" }, d.at ? "stock is at the entry" : `${d.r} R · ${d.pct}% away`),
+        el("span", { class: "near-bar" }, el("span", { style: `width:${(d.fill * 100).toFixed(0)}%` })),
+        el("span", { class: "sub" }, `${sp == null ? "" : fmtPrice(sp)} → ${fmtPrice(o.entry)} · ${speed.text}`));
+    pend.append(el("tr", { class: d ? "near-row near-" + d.group : "" },
+      optCell(o), dist, strikeCell(o),
+      el("td", {}, o.expiry || "", el("span", { class: "sub" }, o.days_left == null ? "" : `${o.days_left} days`)),
+      premCell(o),
+      est(o.est_entry_now ?? o.est_entry, o.entry, "when stock"),
+      est(o.est_stop_now ?? o.est_stop, o.stop, "when stock"),
+      est(o.est_target_now ?? o.est_target, o.target, "when stock"),
+      el("td", { class: "num" }, `${o.lots} × ${o.lot_size}`, el("span", { class: "sub" }, `≈ ₹${money(o.cost)}`)),
+      el("td", { class: "num" }, `₹${money(o.risk_amount)}`),
+      el("td", { class: "num" }, `${fmtPrice(o.entry)} / ${fmtPrice(o.stop)} / ${fmtPrice(o.target)}`,
+        o.note && o.note.startsWith("waiting") ? el("span", { class: "sub loss" }, o.note) : el("span", { class: "sub" }, ENTRY_TEXT[o.entry_type] || "")),
+      el("td", { class: "when" }, stamp(o.created_at), el("span", { class: "sub" }, o.placed_by === "auto" ? (o.note || "auto") : "by you")),
+      el("td", {}, rowBtn("Cancel", () => act("Order cancelled.", () => post(`/api/option-paper/${o.id}/close`))))));
+  }
+}
+
 let previews = {}, previewsLoading = false, previewError = null;
 async function loadPreviews() {
   if (previewsLoading || !data) return;
@@ -152,7 +202,11 @@ async function load() {
   data = await api("/api/option-paper/positions");
   const s = data.settings;
   for (const k of SETTINGS) if (document.activeElement !== $(k)) $(k).value = s[k] ?? "";
+  $("opt_lot_mode").value = s.opt_lot_mode === "risk" ? "risk" : "fixed";
   $("opt_auto").checked = Boolean(s.opt_auto);
+  const score = String(Math.round(Number(s.opt_auto_min_score ?? 8)));
+  if (![...$("opt_auto_min_score").options].some((o) => o.value === score)) $("opt_auto_min_score").append(el("option", {}, score));
+  $("opt_auto_min_score").value = score;
   $("opt_auto_closed").checked = Boolean(s.opt_auto_closed);
   render();
 }
@@ -160,11 +214,23 @@ async function act(done, fn) { try { await fn(); say(done); await load(); } catc
 
 $("opt-save").onclick = () => {
   previews = {};
-  const body = { opt_auto: $("opt_auto").checked, opt_auto_closed: $("opt_auto_closed").checked, opt_strike_rule: $("opt_strike_rule").value, opt_expiry_close: $("opt_expiry_close").value.trim() };
+  const body = { opt_lot_mode: $("opt_lot_mode").value, opt_strike_rule: $("opt_strike_rule").value, opt_expiry_close: $("opt_expiry_close").value.trim() };
   for (const k of SETTINGS) if (!(k in body)) body[k] = Number($(k).value);
   act("Option settings saved. New orders use them; orders already placed keep their strike and lots.",
     () => api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
 };
+// Automatic option orders: saved as soon as they change, like the Paper page.
+const putSettings = (body) => api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+const saveAuto = () => act($("opt_auto").checked
+    ? `Automatic option orders on for score ${$("opt_auto_min_score").value} and above (market hours).`
+    : "Automatic option orders off.",
+  () => putSettings({ opt_auto: $("opt_auto").checked, opt_auto_min_score: Number($("opt_auto_min_score").value) }));
+$("opt_auto").onchange = saveAuto; $("opt_auto_min_score").onchange = saveAuto;
+$("opt_auto_closed").onchange = () => act($("opt_auto_closed").checked
+    ? "Automatic option orders will also be placed after a scan while the market is closed."
+    : "Automatic option orders only in market hours.",
+  () => putSettings({ opt_auto_closed: $("opt_auto_closed").checked }));
+
 $("auto-run").onclick = async () => {
   const btn = $("auto-run"); btn.disabled = true;
   try {
@@ -186,7 +252,11 @@ function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/live`);
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.type === "prices") { Object.assign(prices, m.data); lastPrice = Date.now(); render(); }
+    if (m.type === "prices") {
+      Object.assign(prices, m.data); lastPrice = Date.now();
+      if (data) for (const o of data.pending) trackPrice(history, o.underlying_key, prices[o.underlying_key], lastPrice);
+      render();
+    }
     else if (m.type === "option-paper" || m.type === "scan") reloadSoon();
   };
   ws.onclose = () => setTimeout(connect, 3000);

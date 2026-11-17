@@ -103,6 +103,9 @@ DEFAULTS = {
     "paper_auto_closed": False,      # also place automatic orders after a scan while the market is closed (from the saved scan)
     # option paper trading (its own account): buy a call on a BUY signal, a put on a SELL signal, managed on the stock's price
     "opt_paper_capital": 500000.0, "opt_paper_risk_pct": 1.0,
+    "opt_lot_mode": "fixed",         # fixed: always opt_fixed_lots a order | risk: as many lots as the risk % allows
+    "opt_fixed_lots": 1,
+    "opt_max_risk": 0.0,             # fixed lots: skip an order that would risk more than this many rupees (0 = no limit)
     "opt_strike_rule": "delta",      # delta (nearest 0.55) | atm | otm1 (one strike out of the money) | target (strike nearest the target)
     "opt_min_days": 7,               # nearest expiry with at least this many days left, else the next one
     "opt_max_premium_pct": 20.0,     # one trade's premium at most this % of the option account balance

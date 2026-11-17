@@ -71,10 +71,14 @@ def pick_strike(strikes: list[dict], signal: str, rule: str, spot: float, target
     return row, leg, RULE_TEXT.get(rule, rule)
 
 
+LOT_MODES = ("fixed", "risk")
+
+
 def size(leg: dict, spot: float, entry: float, stop: float, target: float, lot: int, budget: float,
-         max_premium: float) -> dict:
-    """Estimated premiums at the stock's entry, stop and target, and the lots: as many as the risk budget allows,
-    then no more than the premium cap. lots 0 comes with the reason."""
+         max_premium: float, mode: str = "risk", fixed_lots: int = 1, max_risk: float = 0) -> dict:
+    """Estimated premiums at the stock's entry, stop and target, and the lots. mode "risk": as many lots as the risk
+    budget allows. mode "fixed": always fixed_lots, skipped only when that risks more than max_risk (0 = no limit).
+    Either way no more than the premium cap. lots 0 comes with the reason."""
     at = {k: premium_at(leg, spot, v) for k, v in (("entry", entry), ("stop", stop), ("target", target))}
     out = {"est_entry": at["entry"], "est_stop": at["stop"], "est_target": at["target"], "lots": 0, "why": None,
            "risk_per_lot": None}
@@ -87,11 +91,22 @@ def size(leg: dict, spot: float, entry: float, stop: float, target: float, lot: 
         return out
     per_lot = risk_unit * lot
     out["risk_per_lot"] = round(per_lot, 2)
+    cap = int(max_premium // (at["entry"] * lot)) if at["entry"] > 0 else 10 ** 6
+    if mode == "fixed":
+        lots = max(1, int(fixed_lots or 1))
+        word = f"{lots} lot{'s' if lots > 1 else ''}"
+        if max_risk and per_lot * lots > max_risk:
+            out["why"] = f"{word} risk about ₹{per_lot * lots:,.0f}, above your limit of ₹{max_risk:,.0f} an order"
+            return out
+        if cap < lots:
+            out["why"] = f"{word} cost about ₹{at['entry'] * lot * lots:,.0f}, above the premium limit of ₹{max_premium:,.0f}"
+            return out
+        out["lots"] = lots
+        return out
     lots = int(budget // per_lot)
     if lots <= 0:
         out["why"] = f"1 lot risks about ₹{per_lot:,.0f}, above your ₹{budget:,.0f} per trade"
         return out
-    cap = int(max_premium // (at["entry"] * lot)) if at["entry"] > 0 else lots
     if cap <= 0:
         out["why"] = f"1 lot costs about ₹{at['entry'] * lot:,.0f}, above the premium limit of ₹{max_premium:,.0f}"
         return out
@@ -166,7 +181,9 @@ async def choose(db: Session, client, plan: TradePlan, now: datetime, spot: floa
     lot = int(db.scalar(select(Instrument.lot_size).where(Instrument.instrument_key == leg["instrument_key"])) or 1)
     bal = balance(db)
     budget = bal * float(_s(db, "opt_paper_risk_pct")) / 100
-    sized = size(leg, spot, plan.entry, plan.stop, plan.target, lot, budget, bal * float(_s(db, "opt_max_premium_pct")) / 100)
+    mode = _s(db, "opt_lot_mode") if _s(db, "opt_lot_mode") in LOT_MODES else "risk"
+    sized = size(leg, spot, plan.entry, plan.stop, plan.target, lot, budget, bal * float(_s(db, "opt_max_premium_pct")) / 100,
+                 mode, int(_s(db, "opt_fixed_lots") or 1), float(_s(db, "opt_max_risk") or 0))
     otype = "CE" if signal == "BUY" else "PE"
     label = f"{_symbol(db, key)} {date.fromisoformat(expiry):%d %b} {row['strike']:g} {otype}".upper()
     out = {"zone": zone, "key": key, "signal": signal, "expiry": expiry, "days_left": (date.fromisoformat(expiry) - now.date()).days,
@@ -490,17 +507,56 @@ def estimate(t: OptionPaperTrade, level: float | None) -> float | None:
     return premium_at({"ltp": premium, "delta": t.delta, "gamma": t.gamma}, spot, level)
 
 
-def view(t: OptionPaperTrade, now: datetime) -> dict:
+def trail_view(t: OptionPaperTrade, th: dict | None = None) -> dict:
+    """The open position's stop as the Paper page shows it: the method, the stop moves, and what the stop keeps if it
+    is hit, in R and in rupees of the OPTION (its estimated premium at the stock's stop), before and after charges;
+    for the lock method the step ladder on the stock's price."""
+    st = t.trail or {}
+    side = "demand" if t.signal == "BUY" else "supply"
+    qty = int(t.quantity or 0)
+    at_stop = estimate(t, t.stop)
+    keeps = round((at_stop - (t.fill_premium or 0)) * qty, 2) if at_stop is not None else None
+    after = None
+    if keeps is not None and th:
+        after = round(keeps - charges((t.fill_premium or 0) * qty, at_stop * qty, th), 2)
+    view = {"method": st.get("trail_method") or "off", "moves": int(st.get("moves") or 0),
+            "first_stop": st.get("first_stop", t.first_stop), "risk": abs((t.fill_spot or 0) - (st.get("first_stop") or t.first_stop or 0)) or None,
+            "locked_r": round(keeps / t.risk_amount, 2) if keeps is not None and t.risk_amount else None,
+            "locked_inr": keeps, "locked_after_charges": after, "best": t.best_spot, "live": st.get("trail_tf") == "live",
+            "premium_at_stop": at_stop}
+    if view["method"] == "lock" and st.get("first_target") is not None and t.fill_spot is not None:
+        view.update(trailing.ladder(side, t.fill_spot, st["first_stop"], st["first_target"], st, t.stop, t.target, t.best_spot))
+    return view
+
+
+def apply_trailing(db: Session, trade_id: int, now: datetime) -> OptionPaperTrade:
+    """Switch an open option position to the trailing settings of now (lock or step, on the stock's price), from its
+    first stop and target, and move the stop at once if the best stock price since the fill already passed steps."""
+    t = db.get(OptionPaperTrade, trade_id)
+    if t is None or t.status != "open":
+        raise ValueError("No open option position with that id.")
+    st = _trail_start(db, t)
+    if st is None:
+        raise ValueError("Trailing in Settings is off, or set to swing or ATR (option positions use lock or step). "
+                         "Choose Lock or Step under Settings, Trailing stop loss, then press this again.")
+    t.trail = st
+    if t.last_spot is not None and (t.best_spot is None or _reached(t.signal, t.last_spot, t.best_spot)):
+        t.best_spot = t.last_spot
+    t.history = list(t.history or []) + [{"time": now.isoformat(timespec="seconds"), "field": "trail", "old": None,
+                                           "new": st["trail_method"], "note": "trailing applied from Settings"}]
+    _trail(db, t, now)
+    db.commit()
+    return t
+
+
+def view(t: OptionPaperTrade, now: datetime, th: dict | None = None) -> dict:
     qty = t.quantity or 0
     open_pnl = round(((t.last_premium or 0) - (t.fill_premium or 0)) * qty, 2) if t.status == "open" and t.last_premium is not None else None
     sign = 1 if t.signal == "BUY" else -1
     away = None
     if t.status == "pending" and t.last_spot and t.entry:
         away = round(100 * sign * (t.last_spot - t.entry) / t.entry, 2)
-    lock = None
-    st = t.trail or {}
-    if t.status == "open" and st.get("trail_method") == "lock" and st.get("first_target") is not None:
-        lock = trailing.ladder("demand" if t.signal == "BUY" else "supply", t.fill_spot, st["first_stop"], st["first_target"], st, t.stop)
+    lock = trail_view(t, th) if t.status == "open" else None
     out = {c.name: getattr(t, c.name) for c in t.__table__.columns}
     est = lambda level: estimate(t, level)
     out.update({"est_stop_now": est(t.stop) if t.status in OPEN_STATES else None,

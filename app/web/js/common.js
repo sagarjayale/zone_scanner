@@ -102,7 +102,8 @@ const PAGES = [["scanner", "Dashboard"], ["eye", "GTF EYE"], ["premium", "Premiu
       const age = f.age_s;
       badge.textContent = age == null ? "🟡 Waiting for prices" : age <= 15 ? `🟢 Live · ${age} s` : `🔴 No new price for ${age} s`;
       badge.className = "badge live-feed" + (age != null && age > 15 ? " bad" : "");
-      badge.title = "The app's live price feed (every 5 seconds in market hours)";
+      badge.title = "The app's live price feed (every 5 seconds in market hours)" + (f.phase ? `. Now: ${f.phase}` : "") +
+        (f.api_calls && f.api_calls.quotes ? `. Price calls in the last minute: ${f.api_calls.quotes["60s"]}` : "");
     } catch (e) { badge.textContent = "🔴 App not answering"; badge.className = "badge live-feed bad"; }
   }
   check();

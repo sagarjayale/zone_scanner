@@ -63,8 +63,21 @@ def parse_candle(row: list) -> dict:
 class UpstoxClient:
     def __init__(self, token_getter):
         self._token_getter = token_getter  # callable returning the current access token or ""
-        self.throttle = Throttle()
+        # Upstox counts its limits per API and per user, so each kind of call has its own budget: the live price
+        # round never waits behind a long candle download.
+        self.throttles = {"candles": Throttle(), "quotes": Throttle(), "options": Throttle(), "other": Throttle()}
+        self.throttle = self.throttles["candles"]          # what the Data page shows (the downloads)
         self.http = httpx.AsyncClient(timeout=30)
+
+    @staticmethod
+    def api_group(path: str) -> str:
+        if "historical-candle" in path:
+            return "candles"
+        if "market-quote" in path:
+            return "quotes"
+        if "/option/" in path:
+            return "options"
+        return "other"
 
     # ---- login ----
     @staticmethod
@@ -83,12 +96,12 @@ class UpstoxClient:
         return r.json()["access_token"]
 
     # ---- low level ----
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None, timeout: float | None = None) -> dict:
         token = self._token_getter()
         if not token:
             raise TokenMissing("No Upstox access token. Log in first.")
-        await self.throttle.wait()
-        r = await self.http.get(f"{BASE}{path}", params=params,
+        await self.throttles[self.api_group(path)].wait()
+        r = await self.http.get(f"{BASE}{path}", params=params, timeout=timeout or 30,
                                 headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
         if r.status_code == 401:
             raise TokenMissing("Upstox token expired or invalid. Log in again.")
@@ -112,7 +125,7 @@ class UpstoxClient:
         Upstox keys the response by symbol, so the instrument_token field is used to map back."""
         out: dict[str, float] = {}
         for i in range(0, len(keys), 400):
-            data = await self._get("/v3/market-quote/ltp", {"instrument_key": ",".join(keys[i:i + 400])})
+            data = await self._get("/v3/market-quote/ltp", {"instrument_key": ",".join(keys[i:i + 400])}, timeout=10)
             for item in (data.get("data") or {}).values():
                 if item.get("instrument_token") and item.get("last_price"):
                     out[item["instrument_token"]] = float(item["last_price"])

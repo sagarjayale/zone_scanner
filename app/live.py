@@ -1,6 +1,7 @@
 """Live mode: polls last traded prices for instruments that have setups, raises alerts,
 and pushes prices and alerts to the pages over a WebSocket."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 
 from fastapi import WebSocket
@@ -45,7 +46,14 @@ class Hub:
 
 
 hub = Hub()
-state = {"prices": {}, "last_poll": None, "error": None, "running": False, "last_scan": None, "task": None}
+state = {"prices": {}, "last_poll": None, "error": None, "running": False, "last_scan": None, "task": None,
+         "phase": None, "keys": None, "db_skipped": 0}
+# The price round's database work has its own two threads: it never queues behind the downloads and scans, which use
+# the shared pool. One thread reads the watch list, the other applies fills and alerts (one round at a time).
+_ROUND_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="price-round")
+_apply_future = None
+KEYS_TIMEOUT = 5          # seconds to read the watch list; past that the last list is used
+ROUND_TIMEOUT = 40        # a round that takes longer is stopped; the next one starts on time
 _sent: set[tuple[int, str]] = set()   # (zone id, alert type) already raised
 
 
@@ -140,17 +148,37 @@ def _round_apply(prices: dict, now: datetime) -> tuple:
 
 
 async def poll_once(client, now: datetime | None = None) -> list[dict]:
-    """One price poll. The database work runs in a worker thread, so the pages and the other jobs never wait for it,
-    and the prices are pushed to the pages first, before the fills and alerts are worked out."""
+    """One price poll. Prices are fetched and pushed to the pages first, always; the database work (fills, stops,
+    alerts) runs in the price round's own threads, and when the previous round's database work is still busy (MySQL
+    held by a download) this round skips it instead of waiting, so prices keep flowing."""
+    global _apply_future
     now = now or now_ist()
-    keys = await asyncio.to_thread(_round_keys, now)
+    loop = asyncio.get_running_loop()
+    state["phase"] = "reading the watch list"
+    try:
+        keys = await asyncio.wait_for(loop.run_in_executor(_ROUND_POOL, _round_keys, now), KEYS_TIMEOUT)
+        state["keys"] = keys
+    except asyncio.TimeoutError:
+        keys = state.get("keys")
+        if not keys:
+            raise RuntimeError("the database is busy: the watch list could not be read")
     if not keys:
+        state["phase"] = None
         return []
+    state["phase"] = "fetching prices from Upstox"
     prices = await client.ltp(keys)
     state["prices"].update(prices)
     state["last_poll"], state["error"] = now, None
+    state["phase"] = "pushing prices to the pages"
     await hub.broadcast({"type": "prices", "data": prices, "time": now.isoformat(timespec="seconds")})
-    placed, fills_, opt_events, alerts, opt_auto = await asyncio.to_thread(_round_apply, prices, now)
+    if _apply_future is not None and not _apply_future.done():
+        state["db_skipped"] += 1                          # the last round's database work is still running
+        state["phase"] = None
+        return []
+    state["phase"] = "fills, stops and alerts"
+    _apply_future = loop.run_in_executor(_ROUND_POOL, _round_apply, prices, now)
+    placed, fills_, opt_events, alerts, opt_auto = await _apply_future
+    state["phase"] = "pushing alerts and fills"
     for a in alerts:
         await hub.broadcast(a)
         telegram.notify(telegram.alert_text(a))
@@ -164,6 +192,7 @@ async def poll_once(client, now: datetime | None = None) -> list[dict]:
         telegram.notify(f"Option paper: {e['label']} {e['event']}" + (f" ({e['reason']})" if e.get("reason") else ""))
     if opt_auto:
         start_option_auto(client, now, prices)
+    state["phase"] = None
     return alerts
 
 
@@ -196,7 +225,9 @@ async def poller(client) -> None:
         while True:
             if market_open(now_ist()):
                 try:
-                    await poll_once(client)
+                    await asyncio.wait_for(poll_once(client), ROUND_TIMEOUT)
+                except asyncio.TimeoutError:
+                    state["error"] = f"a price round took over {ROUND_TIMEOUT} s (stuck at: {state.get('phase') or 'unknown'})"
                 except UpstoxError as exc:      # token missing or expired, or an Upstox error: shown on the page
                     state["error"] = str(exc)
                 except Exception as exc:
@@ -217,5 +248,6 @@ def start_poller(client) -> None:
 
 def feed_status(now: datetime) -> dict:
     last = state["last_poll"]
-    return {"running": state["running"], "last_poll": last, "error": state["error"],
+    return {"running": state["running"], "last_poll": last, "error": state["error"], "phase": state.get("phase"),
+            "db_skipped": state.get("db_skipped", 0),
             "stale": bool(market_open(now) and (last is None or (now - last).total_seconds() > STALE_AFTER))}

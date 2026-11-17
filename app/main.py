@@ -654,6 +654,8 @@ def _check_trailing(values: dict) -> None:
 
 def _check_option_paper(values: dict) -> None:
     """The option paper settings."""
+    if values.get("opt_lot_mode") is not None and values["opt_lot_mode"] not in optionpaper.LOT_MODES:
+        raise HTTPException(400, "opt_lot_mode must be 'fixed' or 'risk'.")
     if values.get("opt_strike_rule") is not None and values["opt_strike_rule"] not in optionpaper.RULES:
         raise HTTPException(400, f"opt_strike_rule must be one of {list(optionpaper.RULES)}.")
     for k in ("opt_auto", "opt_auto_closed"):
@@ -673,14 +675,16 @@ def _check_option_paper(values: dict) -> None:
               "opt_min_days": (0, 60, "Minimum days to expiry must be from 0 to 60."),
               "opt_max_premium_pct": (1, 100, "Max premium per trade must be from 1 to 100%."),
               "opt_auto_min_score": (0, 10, "Automatic score must be from 0 to 10."),
-              "opt_premium_stop_pct": (0, 95, "Premium stop must be from 0 (off) to 95%.")}
+              "opt_premium_stop_pct": (0, 95, "Premium stop must be from 0 (off) to 95%."),
+              "opt_fixed_lots": (1, 50, "Fixed lots must be a whole number from 1 to 50."),
+              "opt_max_risk": (0, 1e8, "Max risk an order must be 0 (no limit) or more.")}
     for k, (lo, hi, msg) in ranges.items():
         if values.get(k) is not None:
             try:
                 v = float(values[k])
             except (TypeError, ValueError):
                 raise HTTPException(400, msg)
-            if not lo <= v <= hi or (k == "opt_min_days" and v != int(v)):
+            if not lo <= v <= hi or (k in ("opt_min_days", "opt_fixed_lots") and v != int(v)):
                 raise HTTPException(400, msg)
 
 
@@ -1014,7 +1018,7 @@ def paper_export(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------- option paper
-OPT_SETTINGS = ("opt_paper_capital", "opt_paper_risk_pct", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_auto",
+OPT_SETTINGS = ("opt_paper_capital", "opt_paper_risk_pct", "opt_lot_mode", "opt_fixed_lots", "opt_max_risk", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_auto",
                 "opt_auto_min_score", "opt_auto_closed", "opt_expiry_close", "opt_premium_stop_pct")
 PREVIEW_LIMIT = 20          # plans in one preview request (the page asks a few at a time)
 
@@ -1026,7 +1030,8 @@ def option_paper_positions(db: Session = Depends(get_db)):
     now = data_sync.now_ist()
     rows = db.scalars(select(OptionPaperTrade).where(OptionPaperTrade.archived.isnot(True))
                       .order_by(OptionPaperTrade.id.desc()).limit(400)).all()
-    views = [optionpaper.view(t, now) for t in rows]
+    th = optionpaper._th(db)
+    views = [optionpaper.view(t, now, th) for t in rows]
     pending = [v for v in views if v["status"] == "pending"]
     opened = [v for v in views if v["status"] == "open"]
     closed = sorted([v for v in views if v["status"] in ("closed", "cancelled")], key=lambda v: v["exit_ts"] or v["created_at"] or now, reverse=True)[:200]
@@ -1107,6 +1112,17 @@ async def option_paper_close(trade_id: int, body: dict | None = Body(None), db: 
     return optionpaper.view(t, data_sync.now_ist())
 
 
+@app.post("/api/option-paper/{trade_id}/trail", tags=["option paper"])
+async def option_paper_trail(trade_id: int, db: Session = Depends(get_db)):
+    """Apply the trailing stop of Settings (lock or step, on the stock's price) to an open option position."""
+    try:
+        t = optionpaper.apply_trailing(db, trade_id, data_sync.now_ist())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await live.hub.broadcast({"type": "option-paper", "event": "trailing applied"})
+    return optionpaper.view(t, data_sync.now_ist(), optionpaper._th(db))
+
+
 @app.post("/api/option-paper/reset", tags=["option paper"])
 def option_paper_reset(db: Session = Depends(get_db)):
     """Start the option paper account again: every order and trade is archived (kept in the database, not shown)."""
@@ -1167,7 +1183,8 @@ def live_feed():
     f = live.feed_status(now)
     last = f["last_poll"]
     return {"now": now, "market_open": live.market_open(now), "last_poll": last, "error": f["error"],
-            "age_s": round((now - last).total_seconds()) if last else None, "stale": f["stale"], "pages": len(live.hub.clients)}
+            "age_s": round((now - last).total_seconds()) if last else None, "stale": f["stale"], "pages": len(live.hub.clients),
+            "phase": f.get("phase"), "db_skipped": f.get("db_skipped", 0), "api_calls": {g: t.used() for g, t in client.throttles.items()}}
 
 
 @app.get("/api/live/status", tags=["live"])
