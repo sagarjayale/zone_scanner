@@ -309,6 +309,58 @@ class BacktestTrade(Base):
     zone_distal: Mapped[float | None] = mapped_column(Double)
 
 
+class OptionBacktestRun(Base):
+    """A stock backtest replayed with options: each of its trades bought as an option on the entry and sold on the
+    exit, with real past option prices (Upstox expired contracts) or prices estimated with Black-Scholes."""
+    __tablename__ = "option_backtest_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_run_id: Mapped[int] = mapped_column(Integer, index=True)
+    settings: Mapped[dict | None] = mapped_column(JSONText)
+    summary: Mapped[dict | None] = mapped_column(JSONText)
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running|done|failed|cancelled
+    progress: Mapped[str | None] = mapped_column(String(255))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class OptionBacktestTrade(Base):
+    __tablename__ = "option_backtest_trades"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
+    stock_trade_id: Mapped[int | None] = mapped_column(Integer)
+    instrument_key: Mapped[str] = mapped_column(String(64))
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    mode: Mapped[str | None] = mapped_column(String(12))
+    timeframe: Mapped[str | None] = mapped_column(String(8))
+    signal: Mapped[str | None] = mapped_column(String(4))
+    status: Mapped[str] = mapped_column(String(10), default="done")    # done | skipped
+    note: Mapped[str | None] = mapped_column(String(255))
+    source: Mapped[str | None] = mapped_column(String(10))            # real | estimate
+    option_label: Mapped[str | None] = mapped_column(String(100))
+    option_type: Mapped[str | None] = mapped_column(String(2))
+    strike: Mapped[float | None] = mapped_column(Double)
+    expiry: Mapped[str | None] = mapped_column(String(10))
+    delta: Mapped[float | None] = mapped_column(Double)
+    iv: Mapped[float | None] = mapped_column(Double)
+    lot_size: Mapped[int | None] = mapped_column(Integer)
+    lots: Mapped[int | None] = mapped_column(Integer)
+    entry_ts: Mapped[datetime | None] = mapped_column(DateTime)
+    exit_ts: Mapped[datetime | None] = mapped_column(DateTime)
+    stock_entry: Mapped[float | None] = mapped_column(Double)
+    stock_stop: Mapped[float | None] = mapped_column(Double)
+    stock_exit: Mapped[float | None] = mapped_column(Double)
+    stock_r: Mapped[float | None] = mapped_column(Double)
+    premium_in: Mapped[float | None] = mapped_column(Double)
+    premium_out: Mapped[float | None] = mapped_column(Double)
+    exit_reason: Mapped[str | None] = mapped_column(String(16))      # stock exit | expiry
+    risk_amount: Mapped[float | None] = mapped_column(Double)
+    pnl: Mapped[float | None] = mapped_column(Double)
+    charges: Mapped[float | None] = mapped_column(Double)
+    pnl_after: Mapped[float | None] = mapped_column(Double)
+    result_r: Mapped[float | None] = mapped_column(Double)
+
+
 class OptionSnapshot(Base):
     __tablename__ = "option_snapshots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

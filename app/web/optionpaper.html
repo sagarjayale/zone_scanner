@@ -44,13 +44,19 @@
       <label class="lbl" for="opt_max_risk">Fixed lots: skip an order that risks more than (₹, 0 = no limit)</label><input id="opt_max_risk" type="number" min="0" step="1000">
       <label class="lbl" for="opt_paper_risk_pct">Risk per trade, % of the balance (By risk)</label><input id="opt_paper_risk_pct" type="number" min="0.1" max="10" step="0.1">
       <label class="lbl" for="opt_strike_rule">Strike</label>
-      <select id="opt_strike_rule"><option value="delta">Delta nearest 0.55 (moves almost with the stock)</option><option value="atm">At the money</option>
+      <select id="opt_strike_rule"><option value="mode">Delta by mode (table below)</option><option value="delta">Delta nearest 0.55 for every mode</option><option value="atm">At the money</option>
         <option value="otm1">One strike out of the money</option><option value="target">Strike nearest the target (cheap, decays faster)</option></select>
-      <label class="lbl" for="opt_min_days">Minimum days to expiry</label><input id="opt_min_days" type="number" min="0" max="60" step="1">
+      <label class="lbl" for="opt_days_rule">Minimum days to expiry</label>
+      <select id="opt_days_rule"><option value="mode">By mode (table below)</option><option value="one">One number for every mode</option></select>
+      <label class="lbl" for="opt_min_days">One number for every mode (days)</label><input id="opt_min_days" type="number" min="0" max="60" step="1">
       <label class="lbl" for="opt_max_premium_pct">Max premium per trade, % of the balance</label><input id="opt_max_premium_pct" type="number" min="1" max="100" step="1">
       <label class="lbl" for="opt_expiry_close">Close on the expiry day at (IST)</label><input id="opt_expiry_close" type="text" placeholder="15:15">
       <label class="lbl" for="opt_premium_stop_pct">Extra stop on the premium, % below the fill (0 = off)</label><input id="opt_premium_stop_pct" type="number" min="0" max="95" step="5">
     </div>
+    <p class="hint">By mode: longer trades get a deeper in-the-money strike (a higher delta loses less to time decay) and a
+      later expiry. Stocks have monthly expiries and NIFTY weekly ones; the dates come from Upstox.</p>
+    <div class="table-wrap"><table class="board mode-table"><thead><tr><th>Mode</th><th>Target delta</th><th>Minimum days to expiry</th></tr></thead>
+      <tbody id="mode-table"></tbody></table></div>
     <p class="hint">Trailing uses the Lock or Step settings of the Settings page, on the stock's price, at once on each live price.
       Charges use the brokerage, SEBI, GST and stamp duty of the Settings page, with STT of 0.1% on the sell premium.</p>
     <div class="actions"><button class="btn primary" id="opt-save">Save option settings</button></div>

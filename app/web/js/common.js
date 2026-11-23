@@ -76,7 +76,7 @@ async function showToken(badge) {
 }
 
 // One navigation for every page.
-const PAGES = [["scanner", "Dashboard"], ["eye", "GTF EYE"], ["premium", "Premium"], ["chart", "Chart"], ["paper", "Paper"], ["option-paper", "Option paper"], ["backtest", "Backtest"], ["options", "Options"], ["data", "Data"], ["settings", "Settings"]];
+const PAGES = [["scanner", "Dashboard"], ["eye", "GTF EYE"], ["premium", "Premium"], ["chart", "Chart"], ["paper", "Paper"], ["option-paper", "Option paper"], ["backtest", "Backtest"], ["option-backtest", "Option backtest"], ["options", "Options"], ["data", "Data"], ["settings", "Settings"]];
 (function buildNav() {
   const nav = document.getElementById("nav");
   if (!nav) return;

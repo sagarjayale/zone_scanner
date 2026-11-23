@@ -75,7 +75,7 @@ class UpstoxClient:
             return "candles"
         if "market-quote" in path:
             return "quotes"
-        if "/option/" in path:
+        if "/option/" in path or "expired-instruments" in path:
             return "options"
         return "other"
 
@@ -135,6 +135,24 @@ class UpstoxClient:
         """Put/call option chain for one underlying and one expiry (YYYY-MM-DD)."""
         data = await self._get("/v2/option/chain", {"instrument_key": key, "expiry_date": expiry})
         return data.get("data") or []
+
+    # ---- expired contracts (Upstox Plus): past option prices for the option backtest ----
+    async def expired_expiries(self, key: str) -> list[str]:
+        """The past expiry dates (YYYY-MM-DD) of an underlying's contracts."""
+        data = await self._get("/v2/expired-instruments/expiries", {"instrument_key": key})
+        return sorted(str(d)[:10] for d in (data.get("data") or []))
+
+    async def expired_option_contracts(self, key: str, expiry: str) -> list[dict]:
+        """The option contracts of one past expiry: instrument_key (with the expiry), strike_price, instrument_type,
+        lot_size, trading_symbol."""
+        data = await self._get("/v2/expired-instruments/option/contract", {"instrument_key": key, "expiry_date": expiry})
+        return data.get("data") or []
+
+    async def expired_candles(self, expired_key: str, interval: str, to_date: date, from_date: date) -> list[dict]:
+        """Candles of an expired contract; interval is 1minute, 3minute, 5minute, 15minute, 30minute or day."""
+        path = f"/v2/expired-instruments/historical-candle/{quote(expired_key, safe='')}/{interval}/{to_date}/{from_date}"
+        data = await self._get(path)
+        return sorted((parse_candle(c) for c in (data.get("data") or {}).get("candles", [])), key=lambda c: c["ts"])
 
     async def profile(self) -> dict:
         return await self._get("/v2/user/profile")

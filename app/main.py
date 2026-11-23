@@ -41,8 +41,8 @@ from .sim import backtest as bt
 from .sim import scancheck
 from .sim import paper
 from .sim import trailing
-from .sim import optionpaper
-from .models import OptionPaperTrade
+from .sim import optionbacktest, optionpaper
+from .models import OptionBacktestRun, OptionBacktestTrade, OptionPaperTrade
 from .engine import costs
 from .sim.replay import SESSIONS, ReplaySession
 from .upstox.client import TokenMissing, UpstoxClient, UpstoxError
@@ -226,6 +226,11 @@ def paper_page():
 @app.get("/option-paper", include_in_schema=False)
 def option_paper_page():
     return FileResponse(WEB / "optionpaper.html")
+
+
+@app.get("/option-backtest", include_in_schema=False)
+def option_backtest_page():
+    return FileResponse(WEB / "optionbacktest.html")
 
 
 @app.get("/options", include_in_schema=False)
@@ -654,6 +659,18 @@ def _check_trailing(values: dict) -> None:
 
 def _check_option_paper(values: dict) -> None:
     """The option paper settings."""
+    if values.get("opt_days_rule") is not None and values["opt_days_rule"] not in ("mode", "one"):
+        raise HTTPException(400, "opt_days_rule must be 'mode' or 'one'.")
+    for k, lo, hi, whole, msg in (("opt_mode_delta", 0.05, 0.95, False, "a delta from 0.05 to 0.95"),
+                                  ("opt_mode_min_days", 0, 365, True, "whole days from 0 to 365")):
+        table = values.get(k)
+        if table is None:
+            continue
+        if not isinstance(table, dict) or any(m not in config.MODES for m in table):
+            raise HTTPException(400, f"{k} must map modes ({', '.join(config.MODES)}) to {msg}.")
+        for m, v in table.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi or (whole and v != int(v)):
+                raise HTTPException(400, f"{k}: {m} must be {msg}.")
     if values.get("opt_lot_mode") is not None and values["opt_lot_mode"] not in optionpaper.LOT_MODES:
         raise HTTPException(400, "opt_lot_mode must be 'fixed' or 'risk'.")
     if values.get("opt_strike_rule") is not None and values["opt_strike_rule"] not in optionpaper.RULES:
@@ -879,12 +896,9 @@ async def replay_ws(ws: WebSocket, session_id: str):
 
 
 # ---------------------------------------------------------------- backtest (5)
-@app.post("/api/backtest/run", tags=["backtest"])
-async def backtest_run(symbols: list[str] | str = Body("all"), modes: list[str] = Body(["DAILY"]),
-                       start: date = Body(...), end: date = Body(...), min_score: float | None = Body(None),
-                       cost_pct: float = Body(0.05), entry_plan: str = Body("rule"), db: Session = Depends(get_db)):
-    """Start a backtest on stored candles. modes are GTF analysis modes (each brings its own HTF, ITF and LTF).
-    entry_plan is rule (the entry the trade score takes), type1, type2 or type3. cost_pct is charged on each side of a trade."""
+def _new_backtest(db: Session, symbols, modes: list[str], start: date, end: date, min_score: float | None, cost_pct: float,
+                  entry_plan: str) -> BacktestRun:
+    """Check the inputs and save a new date-range backtest run (not started)."""
     keys = _keys(db, symbols)
     modes = [m.upper() for m in modes]
     if not modes or any(m not in config.MODES for m in modes):
@@ -905,6 +919,16 @@ async def backtest_run(symbols: list[str] | str = Body("all"), modes: list[str] 
                                 "cost_pct": cost_pct, "entry_plan": entry_plan})
     db.add(run)
     db.commit()
+    return run
+
+
+@app.post("/api/backtest/run", tags=["backtest"])
+async def backtest_run(symbols: list[str] | str = Body("all"), modes: list[str] = Body(["DAILY"]),
+                       start: date = Body(...), end: date = Body(...), min_score: float | None = Body(None),
+                       cost_pct: float = Body(0.05), entry_plan: str = Body("rule"), db: Session = Depends(get_db)):
+    """Start a backtest on stored candles. modes are GTF analysis modes (each brings its own HTF, ITF and LTF).
+    entry_plan is rule (the entry the trade score takes), type1, type2 or type3. cost_pct is charged on each side of a trade."""
+    run = _new_backtest(db, symbols, modes, start, end, min_score, cost_pct, entry_plan)
     asyncio.get_running_loop().create_task(asyncio.to_thread(bt.execute, run.id))
     return {"run_id": run.id}
 
@@ -1018,7 +1042,8 @@ def paper_export(db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------- option paper
-OPT_SETTINGS = ("opt_paper_capital", "opt_paper_risk_pct", "opt_lot_mode", "opt_fixed_lots", "opt_max_risk", "opt_strike_rule", "opt_min_days", "opt_max_premium_pct", "opt_auto",
+OPT_SETTINGS = ("opt_paper_capital", "opt_paper_risk_pct", "opt_lot_mode", "opt_fixed_lots", "opt_max_risk", "opt_strike_rule",
+                "opt_mode_delta", "opt_days_rule", "opt_mode_min_days", "opt_min_days", "opt_max_premium_pct", "opt_auto",
                 "opt_auto_min_score", "opt_auto_closed", "opt_expiry_close", "opt_premium_stop_pct")
 PREVIEW_LIMIT = 20          # plans in one preview request (the page asks a few at a time)
 
@@ -1055,6 +1080,8 @@ def option_paper_positions(db: Session = Depends(get_db)):
         x["symbol"] = names.get(x["instrument_key"]) or x["instrument_key"].split("|")[-1]
     signals.sort(key=lambda x: (x["placed"], -(x["score"] or 0), x["symbol"]))
     return {"now": now, "market_open": live.market_open(now), "settings": {k: settings_store.get(db, k) for k in OPT_SETTINGS},
+            "mode_tables": {"delta": {**optionpaper.MODE_DELTA, **(settings_store.get(db, "opt_mode_delta") or {})},
+                            "min_days": {**optionpaper.MODE_MIN_DAYS, **(settings_store.get(db, "opt_mode_min_days") or {})}},
             "summary": {"capital": float(settings_store.get(db, "opt_paper_capital")), "balance": round(bal, 2), "in_positions": round(used, 2),
                         "free": round(bal - used, 2), "open_pnl": round(sum(v["open_pnl"] or 0 for v in opened), 2),
                         "closed_pnl": round(sum(v["pnl_after"] or 0 for v in closed if v["status"] == "closed"), 2),
@@ -1146,6 +1173,110 @@ def option_paper_export(db: Session = Depends(get_db)):
         v["duration"] = _duration(v["open_s"])
         out.append([v.get(c) for c in OPT_CSV])
     return _csv(out, OPT_CSV, "option_paper_trades.csv")
+
+
+# ---------------------------------------------------------------- option backtest
+@app.post("/api/option-backtest/run", tags=["option backtest"])
+async def option_backtest_run(source_run_id: int = Body(..., embed=True), source: str = Body("auto", embed=True),
+                              db: Session = Depends(get_db)):
+    """Replay a finished stock backtest with options. source: auto (real past option prices where Upstox has them,
+    else estimated), real (only real prices; Upstox Plus) or estimate (Black-Scholes from the stock's candles)."""
+    if source not in optionbacktest.SOURCES:
+        raise HTTPException(400, f"source must be one of {list(optionbacktest.SOURCES)}.")
+    src = db.get(BacktestRun, source_run_id)
+    if src is None:
+        raise HTTPException(404, "No such stock backtest or scan-date check.")
+    if src.status != "done":
+        raise HTTPException(400, "That backtest has not finished. Choose a finished one.")
+    n = len(optionbacktest.source_trades(db, src))
+    if not n:
+        raise HTTPException(400, "That one has no entered trades to replay.")
+    run = OptionBacktestRun(source_run_id=source_run_id, status="running", progress=f"0 of {n} trades", created_at=data_sync.now_ist(),
+                            settings={"source": source, "source_run": _run_head(src)["settings"], "kind": "scan" if _is_scan(src) else "range",
+                                      "strike_rule": settings_store.get(db, "opt_strike_rule"), "lot_mode": settings_store.get(db, "opt_lot_mode"),
+                                      "fixed_lots": settings_store.get(db, "opt_fixed_lots")})
+    db.add(run)
+    db.commit()
+    asyncio.get_running_loop().create_task(optionbacktest.execute(run.id, client, data_sync.now_ist().date()))
+    return {"run_id": run.id}
+
+
+@app.post("/api/option-backtest/start", tags=["option backtest"])
+async def option_backtest_start(symbols: list[str] | str = Body("all"), modes: list[str] = Body(["DAILY"]), start: date = Body(...),
+                                end: date = Body(...), source: str = Body("auto"), cost_pct: float = Body(0.05),
+                                min_score: float | None = Body(None), db: Session = Depends(get_db)):
+    """One button: a date-range stock backtest (stocks, modes, from, to) and then its option replay."""
+    if source not in optionbacktest.SOURCES:
+        raise HTTPException(400, f"source must be one of {list(optionbacktest.SOURCES)}.")
+    stock = _new_backtest(db, symbols, modes, start, end, min_score, cost_pct, "rule")
+    run = OptionBacktestRun(source_run_id=stock.id, status="running", progress="stock backtest: starting", created_at=data_sync.now_ist(),
+                            settings={"source": source, "source_run": stock.settings, "kind": "range",
+                                      "strike_rule": settings_store.get(db, "opt_strike_rule"), "lot_mode": settings_store.get(db, "opt_lot_mode"),
+                                      "fixed_lots": settings_store.get(db, "opt_fixed_lots")})
+    db.add(run)
+    db.commit()
+    asyncio.get_running_loop().create_task(optionbacktest.run_after_stock_backtest(stock.id, run.id, client, data_sync.now_ist().date()))
+    return {"run_id": run.id, "stock_run_id": stock.id}
+
+
+def _obt_head(r: OptionBacktestRun) -> dict:
+    return {"id": r.id, "source_run_id": r.source_run_id, "status": r.status, "progress": r.progress, "error": r.error,
+            "created_at": r.created_at, "ended_at": r.ended_at, "settings": r.settings, "summary": r.summary}
+
+
+@app.get("/api/option-backtest/runs", tags=["option backtest"])
+def option_backtest_runs(db: Session = Depends(get_db)):
+    """The option backtests (newest first) and the finished stock backtests they can be made from."""
+    runs = db.scalars(select(OptionBacktestRun).order_by(OptionBacktestRun.id.desc()).limit(50)).all()
+    done = db.scalars(select(BacktestRun).where(BacktestRun.status == "done").order_by(BacktestRun.id.desc()).limit(150)).all()
+    stock = [_run_head(r) for r in done if not _is_scan(r)][:50]
+    checks = [{"id": r.id, "created_at": r.created_at, "mode": r.settings.get("mode"), "scan_date": r.settings.get("scan_date"),
+               "stocks": len(r.settings.get("symbols") or []),
+               "entered": sum(v.get("entered", 0) for v in ((r.summary or {}).get("summary") or {}).values() if isinstance(v, dict))}
+              for r in done if _is_scan(r)][:50]
+    return {"runs": [_obt_head(r) for r in runs], "stock_runs": stock, "scan_checks": checks}
+
+
+@app.get("/api/option-backtest/{run_id}", tags=["option backtest"])
+def option_backtest_get(run_id: int, db: Session = Depends(get_db)):
+    r = db.get(OptionBacktestRun, run_id)
+    if r is None:
+        raise HTTPException(404, "No such option backtest.")
+    trades = db.scalars(select(OptionBacktestTrade).where(OptionBacktestTrade.run_id == run_id).order_by(OptionBacktestTrade.entry_ts)).all()
+    return {**_obt_head(r), "trades": [row(t) for t in trades]}
+
+
+@app.post("/api/option-backtest/{run_id}/cancel", tags=["option backtest"])
+def option_backtest_cancel(run_id: int, db: Session = Depends(get_db)):
+    r = db.get(OptionBacktestRun, run_id)
+    if r is None:
+        raise HTTPException(404, "No such option backtest.")
+    if r.status == "running":
+        optionbacktest.CANCEL.add(run_id)
+    return {"id": run_id, "status": r.status}
+
+
+@app.delete("/api/option-backtest/{run_id}", tags=["option backtest"])
+def option_backtest_delete(run_id: int, db: Session = Depends(get_db)):
+    r = db.get(OptionBacktestRun, run_id)
+    if r is None:
+        raise HTTPException(404, "No such option backtest.")
+    if r.status == "running":
+        raise HTTPException(400, "Cancel the run first.")
+    db.query(OptionBacktestTrade).filter(OptionBacktestTrade.run_id == run_id).delete()
+    db.delete(r)
+    db.commit()
+    return {"deleted": run_id}
+
+
+@app.get("/api/option-backtest/{run_id}/export", tags=["option backtest"])
+def option_backtest_export(run_id: int, db: Session = Depends(get_db)):
+    """The option backtest's trades as CSV (skipped ones too, with the reason). Times are IST."""
+    trades = db.scalars(select(OptionBacktestTrade).where(OptionBacktestTrade.run_id == run_id).order_by(OptionBacktestTrade.entry_ts)).all()
+    if not trades:
+        raise HTTPException(404, "This run has no trades to export.")
+    cols = [c.name for c in OptionBacktestTrade.__table__.columns if c.name not in ("id", "run_id")]
+    return _csv([[getattr(t, c) for c in cols] for t in trades], cols, f"option_backtest_{run_id}.csv")
 
 
 SCAN_CSV = ["stock", "instrument_key", "mode", "scan_date", "price", "signal", "score", "zone_type", "reason", "curve", "itf_trend",

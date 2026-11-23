@@ -110,8 +110,17 @@ async function loadPast() {
     body.append(el("tr", { class: "pick", "aria-selected": String(c.id === shown), onclick: () => openPast(c.id) },
       el("td", {}, `#${c.id}`), el("td", {}, stamp(c.created_at)), el("td", {}, c.scan_date), el("td", {}, MODE_LABEL[c.mode] || c.mode), el("td", { class: "num" }, String(c.stocks)),
       ...(isOldCheck(s) ? OLD_PLANS.map((k) => planCell(s[k], PLAN_NAME[k])) : NEW_PLANS.map((k) => planCell(s[k]))),
-      el("td", {}, el("button", { class: "btn", onclick: (e) => { e.stopPropagation(); removePast(c.id); } }, "Delete"))));
+      el("td", {}, el("div", { class: "rowbtns" },
+        el("button", { class: "btn", title: "Replay the entries of this check with options (Option backtest page)", onclick: (e) => { e.stopPropagation(); replayOptions(c.id); } }, "Replay with options"),
+        el("button", { class: "btn", onclick: (e) => { e.stopPropagation(); removePast(c.id); } }, "Delete")))));
   }
+}
+// The entries of a saved check, replayed with options: started here, followed on the Option backtest page.
+async function replayOptions(id) {
+  try {
+    const r = await post("/api/option-backtest/run", { source_run_id: id, source: "auto" });
+    location.href = `/option-backtest?show=${r.run_id}`;
+  } catch (e) { say(`Could not replay check #${id} with options. ${e.message}`, true); }
 }
 async function openPast(id) {
   try { showReport(await api(`/api/scancheck/${id}`)); say(`Showing saved check #${id}.`); await loadPast(); $("s-result").scrollIntoView({ behavior: "smooth", block: "start" }); }

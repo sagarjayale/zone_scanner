@@ -203,6 +203,8 @@ async function load() {
   const s = data.settings;
   for (const k of SETTINGS) if (document.activeElement !== $(k)) $(k).value = s[k] ?? "";
   $("opt_lot_mode").value = s.opt_lot_mode === "risk" ? "risk" : "fixed";
+  $("opt_days_rule").value = s.opt_days_rule === "one" ? "one" : "mode";
+  if (!$("mode-table").contains(document.activeElement)) fillModeTable(data.mode_tables);
   $("opt_auto").checked = Boolean(s.opt_auto);
   const score = String(Math.round(Number(s.opt_auto_min_score ?? 8)));
   if (![...$("opt_auto_min_score").options].some((o) => o.value === score)) $("opt_auto_min_score").append(el("option", {}, score));
@@ -214,11 +216,28 @@ async function act(done, fn) { try { await fn(); say(done); await load(); } catc
 
 $("opt-save").onclick = () => {
   previews = {};
-  const body = { opt_lot_mode: $("opt_lot_mode").value, opt_strike_rule: $("opt_strike_rule").value, opt_expiry_close: $("opt_expiry_close").value.trim() };
+  const body = { opt_lot_mode: $("opt_lot_mode").value, opt_days_rule: $("opt_days_rule").value, ...modeTables(), opt_strike_rule: $("opt_strike_rule").value, opt_expiry_close: $("opt_expiry_close").value.trim() };
   for (const k of SETTINGS) if (!(k in body)) body[k] = Number($(k).value);
   act("Option settings saved. New orders use them; orders already placed keep their strike and lots.",
     () => api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
 };
+// Delta and minimum days for each mode (Option paper settings).
+const MODE_ORDER = ["30M", "HOURLY", "2HR", "4HR", "DAILY", "WEEKLY", "MONTHLY", "QUARTERLY", "HALFYEARLY", "YEARLY"];
+function fillModeTable(t) {
+  if (!t) return;
+  $("mode-table").replaceChildren(...MODE_ORDER.map((m) => el("tr", {}, el("td", {}, MODE_LABEL[m] || m),
+    el("td", {}, el("input", { type: "number", min: "0.05", max: "0.95", step: "0.05", value: t.delta[m], "data-mode": m, "data-kind": "delta", "aria-label": `Target delta, ${MODE_LABEL[m] || m}` })),
+    el("td", {}, el("input", { type: "number", min: "0", max: "365", step: "1", value: t.min_days[m], "data-mode": m, "data-kind": "days", "aria-label": `Minimum days, ${MODE_LABEL[m] || m}` })))));
+}
+function modeTables() {
+  const delta = {}, days = {};
+  for (const i of $("mode-table").querySelectorAll("input")) {
+    if (i.value === "") continue;
+    (i.dataset.kind === "delta" ? delta : days)[i.dataset.mode] = Number(i.value);
+  }
+  return { opt_mode_delta: delta, opt_mode_min_days: days };
+}
+
 // Automatic option orders: saved as soon as they change, like the Paper page.
 const putSettings = (body) => api("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 const saveAuto = () => act($("opt_auto").checked

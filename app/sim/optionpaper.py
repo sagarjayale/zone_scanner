@@ -20,8 +20,8 @@ from ..models import Instrument, OptionPaperTrade, TradePlan, Zone
 from ..options import chain as options
 from . import trailing
 
-RULES = ("delta", "atm", "otm1", "target")
-RULE_TEXT = {"delta": "delta nearest 0.55", "atm": "at the money", "otm1": "one strike out of the money", "target": "strike nearest the target"}
+RULES = ("mode", "delta", "atm", "otm1", "target")
+RULE_TEXT = {"mode": "delta by mode", "delta": "delta nearest 0.55", "atm": "at the money", "otm1": "one strike out of the money", "target": "strike nearest the target"}
 TARGET_DELTA = 0.55
 OPEN_STATES = ("pending", "open")
 
@@ -39,7 +39,31 @@ def pick_expiry(expiries: list[str], today: date, min_days: int) -> str | None:
     return None
 
 
-def pick_strike(strikes: list[dict], signal: str, rule: str, spot: float, target: float) -> tuple[dict | None, dict | None, str]:
+# Longer trades get a deeper in-the-money strike (less time decay) and a later expiry.
+MODE_DELTA = {"30M": 0.55, "HOURLY": 0.55, "2HR": 0.60, "4HR": 0.60, "DAILY": 0.65, "WEEKLY": 0.70,
+              "MONTHLY": 0.75, "QUARTERLY": 0.75, "HALFYEARLY": 0.75, "YEARLY": 0.75}
+MODE_MIN_DAYS = {"30M": 2, "HOURLY": 2, "2HR": 7, "4HR": 7, "DAILY": 14, "WEEKLY": 30,
+                 "MONTHLY": 45, "QUARTERLY": 45, "HALFYEARLY": 45, "YEARLY": 45}
+
+
+def mode_delta(db: Session, mode: str | None) -> float:
+    """The target delta for a mode: "Delta by mode" uses the table in the settings, the other rules 0.55."""
+    if (_s(db, "opt_strike_rule") or "mode") != "mode":
+        return TARGET_DELTA
+    table = {**MODE_DELTA, **(_s(db, "opt_mode_delta") or {})}
+    return float(table.get(mode or "", TARGET_DELTA))
+
+
+def min_days_for(db: Session, mode: str | None) -> int:
+    """The minimum days to expiry: by mode (the table in the settings) or one number for every mode."""
+    if (_s(db, "opt_days_rule") or "mode") == "mode":
+        table = {**MODE_MIN_DAYS, **(_s(db, "opt_mode_min_days") or {})}
+        return int(table.get(mode or "", int(_s(db, "opt_min_days") or 7)))
+    return int(_s(db, "opt_min_days") or 0)
+
+
+def pick_strike(strikes: list[dict], signal: str, rule: str, spot: float, target: float,
+                target_delta: float = TARGET_DELTA) -> tuple[dict | None, dict | None, str]:
     """The strike row and the leg (call on BUY, put on SELL) by the rule. Returns (row, leg, why) with row None when
     nothing fits; why says what was chosen or why not."""
     leg_name = "call" if signal == "BUY" else "put"
@@ -47,12 +71,12 @@ def pick_strike(strikes: list[dict], signal: str, rule: str, spot: float, target
     if not rows:
         return None, None, "the option chain has no contracts on this side"
     atm = min(rows, key=lambda s: abs(s["strike"] - spot))
-    if rule == "delta":
+    if rule in ("delta", "mode"):
         cands = [s for s in rows if s[leg_name].get("delta") is not None]
         liquid = [s for s in cands if s[leg_name].get("liquid")]
         if not cands:
             return None, None, "the option chain has no delta to choose by"
-        row = min(liquid or cands, key=lambda s: abs(abs(s[leg_name]["delta"]) - TARGET_DELTA))
+        row = min(liquid or cands, key=lambda s: abs(abs(s[leg_name]["delta"]) - target_delta))
     elif rule == "atm":
         row = atm
     elif rule == "otm1":
@@ -68,7 +92,7 @@ def pick_strike(strikes: list[dict], signal: str, rule: str, spot: float, target
         return None, None, f"{row['strike']:g} {'CE' if signal == 'BUY' else 'PE'} is not liquid (spread or open interest)"
     if not leg.get("ltp"):
         return None, None, f"{row['strike']:g} {'CE' if signal == 'BUY' else 'PE'} has no price"
-    return row, leg, RULE_TEXT.get(rule, rule)
+    return row, leg, (f"delta nearest {target_delta:g}" if rule in ("delta", "mode") else RULE_TEXT.get(rule, rule))
 
 
 LOT_MODES = ("fixed", "risk")
@@ -166,7 +190,7 @@ async def choose(db: Session, client, plan: TradePlan, now: datetime, spot: floa
     exps = options.expiries(db, key, now.date())
     if not exps:
         return {"skipped": "no option contracts for this stock (refresh instruments, or it has no options)"}
-    min_days = int(_s(db, "opt_min_days") or 0)
+    min_days = min_days_for(db, plan.mode)
     expiry = pick_expiry(exps, now.date(), min_days)
     if expiry is None:
         return {"skipped": f"no expiry with at least {min_days} days left"}
@@ -174,8 +198,11 @@ async def choose(db: Session, client, plan: TradePlan, now: datetime, spot: floa
     spot = view.get("spot") or spot
     if not spot:
         return {"skipped": "no price for the stock"}
-    rule = _s(db, "opt_strike_rule") if _s(db, "opt_strike_rule") in RULES else "delta"
-    row, leg, why = pick_strike(view["strikes"], signal, rule, spot, plan.target)
+    rule = _s(db, "opt_strike_rule") if _s(db, "opt_strike_rule") in RULES else "mode"
+    want = mode_delta(db, plan.mode)
+    row, leg, why = pick_strike(view["strikes"], signal, rule, spot, plan.target, want)
+    if row is not None:
+        why = f"{(plan.mode or '').title()}: {why}, at least {min_days} days to expiry"
     if row is None:
         return {"skipped": why}
     lot = int(db.scalar(select(Instrument.lot_size).where(Instrument.instrument_key == leg["instrument_key"])) or 1)

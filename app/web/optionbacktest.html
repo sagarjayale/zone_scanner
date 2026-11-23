@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Option backtest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">Zone scanner</span>
+  <nav class="nav" id="nav" aria-label="Pages" data-current="option-backtest"></nav>
+  <span class="spacer"></span>
+  <span class="badge" id="token">Checking login</span>
+</header>
+<main class="page">
+  <h1>Option backtest</h1>
+  <p class="lede">A finished stock backtest, replayed with options: every trade bought as an option at the stock's entry and
+    sold at the stock's exit (or on the option's expiry day at 15:15 when it expires first), the way Option paper would have
+    done it on that day: a call on a BUY, a put on a SELL, the expiry and strike by your Option paper settings (delta and
+    minimum days by mode, lots per order).</p>
+
+  <div class="panel">
+    <h2>New backtest with options</h2>
+    <p class="hint">One button: the stock backtest over the dates first, then every trade replayed with options.</p>
+    <fieldset class="obt-stocks">
+      <legend>Stocks</legend>
+      <label class="check all"><input type="checkbox" id="n-all" checked> All stocks</label>
+      <div class="checks" id="n-symbols"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Modes</legend>
+      <div class="checks" id="n-modes"></div>
+    </fieldset>
+    <div class="grid obt-form">
+      <label class="lbl" for="n-start">From</label><input type="date" id="n-start">
+      <label class="lbl" for="n-end">To</label><input type="date" id="n-end">
+      <label class="lbl" for="n-source">Option prices</label>
+      <select id="n-source">
+        <option value="auto">Auto: real past prices where Upstox has them, else estimated</option>
+        <option value="real">Real only (Upstox Plus: expired contracts)</option>
+        <option value="estimate">Estimated only (Black-Scholes from the stock's candles)</option>
+      </select>
+    </div>
+    <div class="actions"><button class="btn primary" id="n-run">Run backtest with options</button></div>
+    <p class="hint" id="n-help"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Or replay one you already have</h2>
+    <div class="grid obt-form">
+      <label class="lbl" for="stock-run">Stock backtest or scan-date check</label>
+      <select id="stock-run" aria-label="The finished stock backtest or saved scan-date check to replay"></select>
+      <label class="lbl" for="source">Option prices</label>
+      <select id="source">
+        <option value="auto">Auto: real past prices where Upstox has them, else estimated</option>
+        <option value="real">Real only (Upstox Plus: expired contracts)</option>
+        <option value="estimate">Estimated only (Black-Scholes from the stock's candles)</option>
+      </select>
+    </div>
+    <div class="actions"><button class="btn primary" id="run">Replay with options</button></div>
+    <p class="hint">Real prices come from Upstox's expired-contract candles, a feature of the Upstox Plus plan. Estimated prices use
+      Black-Scholes with the stock's 20-day volatility and NSE's expiry days: a guide, with no real spread and no IV spike around news.
+      Each trade says which it used. Scan-date checks are saved on the Backtest page (Check this date); their entered trades are replayed.</p>
+  </div>
+  <p class="status" id="status" role="status"></p>
+
+  <h2>Option backtests</h2>
+  <div class="table-wrap"><table class="board"><thead><tr><th>#</th><th>From stock backtest</th><th>Prices</th><th>Status</th>
+    <th>Trades</th><th>Win rate</th><th>Profit or loss after charges</th><th>Total R</th><th></th></tr></thead><tbody id="runs"></tbody></table></div>
+
+  <section id="result" hidden>
+    <div class="head"><h2 id="result-title">Result</h2><span class="spacer"></span><a class="btn" id="export" download>Download CSV</a></div>
+    <dl class="figures" id="figures"></dl>
+    <p class="hint" id="compare"></p>
+    <div class="table-wrap"><table class="board"><thead><tr><th>Stock</th><th>Signal</th><th>Option</th><th>Entry time</th><th>Exit time</th>
+      <th>Premium in → out</th><th>Stock in → out</th><th>Why</th><th>Lots</th><th>Charges</th><th>Profit or loss</th><th>R (option / stock)</th><th>Prices</th></tr></thead>
+      <tbody id="trades"></tbody></table></div>
+    <h3>Skipped trades</h3>
+    <ul class="skips" id="skips"></ul>
+  </section>
+</main>
+<script src="/static/js/common.js"></script>
+<script src="/static/js/paperview.js"></script>
+<script src="/static/js/optionbacktest.js"></script>
+</body>
+</html>

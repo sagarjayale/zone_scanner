@@ -358,3 +358,17 @@ table.trail-ex td, table.trail-ex th { padding: 4px 12px; }
 
 .live-feed { margin-left: 8px; white-space: nowrap; }
 .live-feed.bad { border-color: var(--supply); color: var(--supply); }
+
+.mode-table { width: auto; }
+.mode-table input { width: 90px; }
+
+/* option backtest */
+.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 0 0 14px; }
+.obt-form { display: grid; grid-template-columns: minmax(140px, 220px) minmax(200px, 640px); gap: 8px 14px; align-items: center; }
+.obt-form select { background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; min-height: 34px; width: 100%; }
+@media (max-width: 640px) { .obt-form { grid-template-columns: 1fr; } }
+.skips { color: var(--muted); font-size: 14px; }
+.panel h2 { margin-top: 0; }
+.panel fieldset { border: 0; padding: 0; margin: 0 0 10px; }
+.panel fieldset legend { font-weight: 600; margin-bottom: 4px; }
+.obt-form input[type="date"] { background: var(--panel); color: inherit; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; min-height: 34px; }

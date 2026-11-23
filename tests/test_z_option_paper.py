@@ -21,6 +21,18 @@ NEAR_EXP = "2026-06-04"                    # 2 days away: below the 7-day minimu
 LOT = 100
 
 
+@pytest.fixture(autouse=True)
+def _one_delta_for_every_mode():
+    """These tests were written for one target delta (0.55) and one minimum (7 days) for every mode; the "by mode"
+    defaults are tested in test_z_option_backtest.py."""
+    with SessionLocal() as db:
+        settings_store.put(db, "opt_strike_rule", "delta")
+        settings_store.put(db, "opt_days_rule", "one")
+    yield
+    with SessionLocal() as db:
+        _unset(db, "opt_strike_rule", "opt_days_rule")
+
+
 def _unset(db, *keys):
     for k in keys:
         row = db.get(Setting, k)
@@ -246,7 +258,8 @@ def test_page_and_api(monkeypatch):
         assert c.post("/api/option-paper/reset").json()["archived"] >= 1
         assert c.get("/api/option-paper/positions").json()["closed"] == []
         with SessionLocal() as db:
-            _unset(db, "opt_strike_rule", "opt_expiry_close")
+            _unset(db, "opt_expiry_close")
+            settings_store.put(db, "opt_strike_rule", "delta")
             _clear(db, key)
 
 
